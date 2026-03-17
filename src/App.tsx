@@ -11,51 +11,164 @@ import {
   updateGameStateFromOperativeMove,
   updateGameStateFromSpymasterMove,
 } from './utils/game';
-import { createMessagesFromGameState, fetchLLMResponse } from './utils/llm';
+import { createMessagesFromGameState, streamLLMResponse } from './utils/llm';
 
 type AppState = 'game_start' | 'ready_for_turn' | 'waiting_for_response' | 'error' | 'game_over';
+type PendingRequest = {
+  modelName: string;
+  team: GameState['currentTeam'];
+  role: GameState['currentRole'];
+  startedAt: number;
+};
 
 export default function App() {
   const [gameState, setGameState] = useState<GameState>(initializeGameState());
   const [appState, setAppState] = useState<AppState>('game_start');
   const [isGamePaused, setIsGamePaused] = useState(true);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [pendingRequest, setPendingRequest] = useState<PendingRequest | null>(null);
+  const [pendingChatMessage, setPendingChatMessage] = useState<{
+    team: PendingRequest['team'];
+    role: PendingRequest['role'];
+    reasoning: string;
+  } | null>(null);
+  const [requestAgeSeconds, setRequestAgeSeconds] = useState(0);
   const chatContainerRef = useRef<HTMLDivElement>(null);
+  const activeTurnKeyRef = useRef<string | null>(null);
+  const activeRequestControllerRef = useRef<AbortController | null>(null);
+
+  const cancelActiveRequest = () => {
+    activeRequestControllerRef.current?.abort();
+    activeRequestControllerRef.current = null;
+    activeTurnKeyRef.current = null;
+  };
 
   useEffect(() => {
-    const fetchResponse = async () => {
-      try {
-        const data = await fetchLLMResponse({
-          messages: createMessagesFromGameState(gameState),
-          modelName:
-            gameState.agents[gameState.currentTeam][gameState.currentRole].openrouter_model_id,
-          referer: 'https://llmcodenames.com',
-          title: 'LLM Codenames',
-        });
-        if (gameState.currentRole === 'spymaster') {
-          setGameState(updateGameStateFromSpymasterMove(gameState, data as SpymasterMove));
-        } else {
-          setGameState(updateGameStateFromOperativeMove(gameState, data as OperativeMove));
-        }
-        setAppState('ready_for_turn');
-      } catch (error) {
-        console.error('Error in fetchResponse:', error);
-        setAppState('error');
-        setIsGamePaused(true);
-      }
-    };
     if (isGamePaused) {
+      cancelActiveRequest();
+      setPendingRequest(null);
+      setPendingChatMessage(null);
+      if (appState === 'waiting_for_response') {
+        setAppState('ready_for_turn');
+      }
       return;
     }
+
     if (gameState.gameWinner) {
+      cancelActiveRequest();
+      setPendingRequest(null);
+      setPendingChatMessage(null);
       setIsGamePaused(true);
       setAppState('game_over');
-    } else if (appState === 'ready_for_turn') {
+      return;
+    }
+
+    if (appState === 'ready_for_turn') {
+      const turnKey = [
+        gameState.chatHistory.length,
+        gameState.currentTeam,
+        gameState.currentRole,
+        gameState.remainingRed,
+        gameState.remainingBlue,
+      ].join(':');
+
+      if (activeTurnKeyRef.current === turnKey) {
+        return;
+      }
+
+      const turnState = gameState;
+      const activeModel = turnState.agents[turnState.currentTeam][turnState.currentRole];
+      const controller = new AbortController();
+      activeTurnKeyRef.current = turnKey;
+      activeRequestControllerRef.current = controller;
       setAppState('waiting_for_response');
-      fetchResponse();
-    } else if (appState === 'game_start') {
+      setPendingRequest({
+        modelName: activeModel.modelName,
+        team: turnState.currentTeam,
+        role: turnState.currentRole,
+        startedAt: Date.now(),
+      });
+      setPendingChatMessage(null);
+      setErrorMessage(null);
+
+      void (async () => {
+        try {
+          let completedMove: SpymasterMove | OperativeMove | null = null;
+          for await (const update of streamLLMResponse(
+            {
+              messages: createMessagesFromGameState(turnState),
+              modelId: activeModel.id,
+              role: turnState.currentRole,
+            },
+            controller.signal,
+          )) {
+            if (activeRequestControllerRef.current !== controller || controller.signal.aborted) {
+              return;
+            }
+
+            if (update.type === 'reasoning') {
+              setPendingChatMessage({
+                team: turnState.currentTeam,
+                role: turnState.currentRole,
+                reasoning: update.reasoning,
+              });
+              continue;
+            }
+
+            completedMove = update.move;
+          }
+
+          if (activeRequestControllerRef.current !== controller || controller.signal.aborted) {
+            return;
+          }
+          if (!completedMove) {
+            throw new Error('The LLM did not return a move.');
+          }
+
+          setPendingRequest(null);
+          setPendingChatMessage(null);
+          if (turnState.currentRole === 'spymaster') {
+            setGameState(updateGameStateFromSpymasterMove(turnState, completedMove as SpymasterMove));
+          } else {
+            setGameState(updateGameStateFromOperativeMove(turnState, completedMove as OperativeMove));
+          }
+          setAppState('ready_for_turn');
+        } catch (error) {
+          if (controller.signal.aborted || activeRequestControllerRef.current !== controller) {
+            return;
+          }
+
+          console.error('Error in fetchResponse:', error);
+          setPendingRequest(null);
+          setPendingChatMessage(null);
+          setErrorMessage(
+            error instanceof Error ?
+              error.message
+            : 'An unknown error occurred while calling the LLM.',
+          );
+          setAppState('error');
+          setIsGamePaused(true);
+        } finally {
+          if (activeRequestControllerRef.current === controller) {
+            activeRequestControllerRef.current = null;
+            activeTurnKeyRef.current = null;
+          }
+        }
+      })();
+
+      return;
+    }
+
+    if (appState === 'game_start') {
       setAppState('ready_for_turn');
     }
   }, [appState, gameState, isGamePaused]);
+
+  useEffect(() => {
+    return () => {
+      cancelActiveRequest();
+    };
+  }, []);
 
   // Handle scrolling to the bottom of the chat history as chats stream in
   useEffect(() => {
@@ -64,13 +177,27 @@ export default function App() {
     }
   }, [gameState, appState]);
 
+  useEffect(() => {
+    if (!pendingRequest) {
+      setRequestAgeSeconds(0);
+      return;
+    }
+
+    setRequestAgeSeconds(Math.floor((Date.now() - pendingRequest.startedAt) / 1000));
+    const interval = window.setInterval(() => {
+      setRequestAgeSeconds(Math.floor((Date.now() - pendingRequest.startedAt) / 1000));
+    }, 1000);
+
+    return () => window.clearInterval(interval);
+  }, [pendingRequest]);
+
   return (
     <div className='flex min-h-screen flex-col items-center justify-around gap-2 bg-gradient-to-br from-slate-800 to-slate-600 antialiased lg:flex-row'>
       {/* Left panel: Scoreboard + Game Board + Game Controls */}
       <div className='flex w-full flex-col items-center gap-y-6 sm:mt-4 lg:w-2/3 lg:gap-y-8'>
         {appState === 'error' && (
           <div className='fixed left-4 top-4 z-50 rounded-md bg-red-500 px-4 py-2 text-white shadow-lg'>
-            An error occurred. Please reload the game.
+            {errorMessage ?? 'An error occurred. Please reload the game.'}
           </div>
         )}
 
@@ -96,11 +223,22 @@ export default function App() {
         {/* Start/Pause game button */}
         <button
           onClick={() => {
+            const shouldResetGame = appState === 'game_over' || appState === 'error';
+            const nextPausedState = shouldResetGame ? false : !isGamePaused;
+
+            if (shouldResetGame || nextPausedState) {
+              cancelActiveRequest();
+              setPendingRequest(null);
+              setPendingChatMessage(null);
+            }
             if (appState === 'game_over' || appState === 'error') {
               setGameState(initializeGameState());
               setAppState('game_start');
+              setErrorMessage(null);
+              setPendingRequest(null);
+              setPendingChatMessage(null);
             }
-            setIsGamePaused(!isGamePaused);
+            setIsGamePaused(nextPausedState);
           }}
           className='mb-6 flex w-36 items-center justify-center gap-2 rounded bg-slate-200 px-2 py-2 font-bold text-slate-800 hover:bg-slate-300'
         >
@@ -127,6 +265,15 @@ export default function App() {
         {gameState.chatHistory.map((message, index) => (
           <Chat key={index} {...message} />
         ))}
+        {pendingChatMessage && pendingRequest && (
+          <Chat
+            message={pendingChatMessage.reasoning}
+            model={gameState.agents[pendingChatMessage.team][pendingChatMessage.role]}
+            team={pendingChatMessage.team}
+            cards={gameState.cards}
+            isStreaming={true}
+          />
+        )}
         {appState === 'game_over' && (
           <div className='flex w-full justify-center p-2 font-semibold tracking-wide'>
             <div
@@ -139,7 +286,15 @@ export default function App() {
         {/* Spinner & Pause indicator */}
         {appState === 'waiting_for_response' && (
           <div className='sticky flex w-full justify-end p-2'>
-            <Loader2 className='animate-spin text-slate-200' />
+            <div className='flex items-center gap-3 rounded-full border border-slate-500/40 bg-slate-900/90 px-4 py-2 text-xs font-semibold tracking-wide text-slate-100 shadow-lg'>
+              <div className='flex flex-col text-right'>
+                <span>{pendingRequest?.modelName ?? 'LLM'} thinking</span>
+                <span className='text-[11px] font-medium uppercase tracking-[0.16em] text-slate-400'>
+                  {pendingRequest?.team} {pendingRequest?.role} · {requestAgeSeconds}s
+                </span>
+              </div>
+              <Loader2 className='size-4 animate-spin text-slate-200' />
+            </div>
           </div>
         )}
         {isGamePaused && appState === 'ready_for_turn' && (

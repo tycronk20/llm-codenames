@@ -24,6 +24,21 @@ export type OperativeMove = {
   reasoning: string;
 };
 
+export function formatMoveMessage(role: 'spymaster', move: SpymasterMove): string;
+export function formatMoveMessage(role: 'operative', move: OperativeMove): string;
+export function formatMoveMessage(
+  role: Role,
+  move: SpymasterMove | OperativeMove,
+): string {
+  if (role === 'spymaster') {
+    const spymasterMove = move as SpymasterMove;
+    return `${spymasterMove.reasoning}\n\nClue: ${spymasterMove.clue.toUpperCase()}, ${spymasterMove.number}`;
+  }
+
+  const operativeMove = move as OperativeMove;
+  return `${operativeMove.reasoning}\n\nGuesses: ${operativeMove.guesses.join(', ')}`;
+}
+
 // Nested object type for team agents to track which LLM model is being used for each role
 export type TeamAgents = {
   [key in Role]: LLMModel;
@@ -105,6 +120,11 @@ const drawNewCards = (): CardType[] => {
 // More agents can be added by editing the `agents` array in `constants/models.ts`
 const selectRandomAgents = (): GameAgents => {
   const availableAgents = [...agents];
+  if (availableAgents.length < 4) {
+    throw new Error(
+      'At least 4 active models are required. Update activeModelIds in src/utils/modelCatalog.ts.',
+    );
+  }
 
   const pickRandomAgent = () => {
     const randomIndex = Math.floor(Math.random() * availableAgents.length);
@@ -140,7 +160,7 @@ export function updateGameStateFromSpymasterMove(
     number: move.number,
   };
   newState.chatHistory.push({
-    message: move.reasoning + '\n\nClue: ' + move.clue.toUpperCase() + ', ' + move.number,
+    message: formatMoveMessage('spymaster', move),
     model: currentState.agents[currentState.currentTeam].spymaster,
     team: currentState.currentTeam,
     cards: currentState.cards,
@@ -159,7 +179,7 @@ export function updateGameStateFromOperativeMove(
 ): GameState {
   const newState = { ...currentState };
   newState.chatHistory.push({
-    message: move.reasoning + '\n\nGuesses: ' + move.guesses.join(', '),
+    message: formatMoveMessage('operative', move),
     model: currentState.agents[currentState.currentTeam].operative,
     team: currentState.currentTeam,
     cards: currentState.cards,

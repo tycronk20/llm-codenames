@@ -19,13 +19,13 @@ export function ModelPill({
       {/* Avatar logo */}
       <img
         src={model.logo}
-        alt={model.short_name}
+        alt={model.shortName}
         className={`h-6 w-6 rounded-full border-black p-1 ${
           teamColor === 'red' ? 'bg-red-50' : 'bg-sky-50'
         }`}
       />
       {/* Model name */}
-      <span className={`text-sm font-bold`}>{model.short_name}</span>
+      <span className={`text-sm font-bold`}>{model.shortName}</span>
     </span>
   );
 }

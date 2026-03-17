@@ -1,8 +1,8 @@
-import { jsonrepair } from 'jsonrepair';
 import { opSysPrompt } from '../prompts/opSysPrompt';
 import { spySysPrompt } from '../prompts/spySysPrompt';
 import { createUserPrompt } from '../prompts/userPrompt';
-import { GameState, OperativeMove, SpymasterMove } from './game';
+import { GameState, OperativeMove, Role, SpymasterMove } from './game';
+import { modelCatalogById } from './modelCatalog';
 
 type Message = {
   role: 'system' | 'user' | 'assistant';
@@ -10,83 +10,298 @@ type Message = {
 };
 
 type LLMRequest = {
-  messages: Message[]; // Array of messages in the conversation
-  modelName: string; // OpenRouter model string (e.g. "openai/gpt-4o")
-  stream?: boolean; // Whether to stream the response
-  referer?: string; // Optional referer URL for OpenRouter identification (e.g. "https://mysite.com")
-  title?: string; // Optional title header for OpenRouter identification (e.g. "My AI App")
+  messages: Message[];
+  modelId: string;
+  role: Role;
 };
 
-const REFERRER = 'https://llmcodenames.com';
-const TITLE = 'LLM Codenames';
+const NETWORK_RETRY_DELAYS_MS = [250, 800];
+const TOKEN_IDLE_TIMEOUT_MS = 10_000;
+
+export class LLMTokenTimeoutError extends Error {
+  code = 'LLM_TOKEN_TIMEOUT';
+
+  constructor(modelLabel: string, timeoutMs: number) {
+    super(`${modelLabel} produced no tokens for ${timeoutMs / 1000} seconds. Turn aborted.`);
+    this.name = 'LLMTokenTimeoutError';
+  }
+}
+
+export type StreamedLLMResponse =
+  | {
+      type: 'reasoning';
+      reasoning: string;
+    }
+  | {
+      type: 'complete';
+      move: SpymasterMove | OperativeMove;
+    };
 
 export function createMessagesFromGameState(gameState: GameState): Message[] {
-  const messages: Message[] = [];
-  messages.push({
-    role: 'system',
-    content: gameState.currentRole === 'spymaster' ? spySysPrompt : opSysPrompt,
-  });
-
-  messages.push({
-    role: 'user',
-    content: createUserPrompt(gameState),
-  });
-
-  return messages;
+  return [
+    {
+      role: 'system',
+      content: gameState.currentRole === 'spymaster' ? spySysPrompt : opSysPrompt,
+    },
+    {
+      role: 'user',
+      content: createUserPrompt(gameState),
+    },
+  ];
 }
 
 export async function fetchLLMResponse(
   request: LLMRequest,
+  signal?: AbortSignal,
 ): Promise<SpymasterMove | OperativeMove> {
-  const CLOUDFLARE_WORKER_URL = import.meta.env.VITE_CLOUDFLARE_WORKER_URL || '';
-  if (!CLOUDFLARE_WORKER_URL) {
-    throw new Error(
-      'Cloudflare Worker URL is not configured. Add VITE_CLOUDFLARE_WORKER_URL to .env',
-    );
-  }
+  const timeout = createIdleTimeout(request.modelId, signal);
+
   try {
-    console.log('Messages:', request.messages);
+    timeout.reset();
 
-    // 1 second delay to make the game less hectic
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-
-    const response = await fetch(CLOUDFLARE_WORKER_URL, {
+    const response = await fetchWithRetry('/api/llm', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        messages: request.messages,
-        modelName: request.modelName,
-        stream: false,
-        referer: request.referer || REFERRER,
-        title: request.title || TITLE,
-      }),
+      body: JSON.stringify(request),
+      signal: timeout.signal,
     });
 
+    timeout.reset();
+    const data = await parseResponseBody(response);
     if (!response.ok) {
-      throw new Error(`API returned ${response.status}: ${response.statusText}`);
+      throw new Error(typeof data?.error === 'string' ? data.error : 'LLM request failed');
     }
 
-    const data = await response.json();
-    console.log('Response:', data);
-
-    if (data.error) {
-      throw new Error(data.error);
-    }
-
-    // Extract the actual content from the OpenRouter response format
-    const rawContent = data.choices[0].message.content;
-
-    // Clean and repair JSON (keeping this from the old proxy)
-    const cleanContent = rawContent.substring(
-      rawContent.indexOf('{'),
-      rawContent.lastIndexOf('}') + 1,
-    );
-    const repairedContent = jsonrepair(cleanContent);
-    return JSON.parse(repairedContent);
+    return data;
   } catch (error) {
-    console.error('Error fetching LLM response:', error);
-    throw error;
+    throw timeout.normalizeError(error);
+  } finally {
+    timeout.dispose();
   }
+}
+
+export async function* streamLLMResponse(
+  request: LLMRequest,
+  signal?: AbortSignal,
+): AsyncGenerator<StreamedLLMResponse, SpymasterMove | OperativeMove, void> {
+  let emittedReasoning = false;
+  const timeout = createIdleTimeout(request.modelId, signal);
+
+  try {
+    timeout.reset();
+
+    const response = await fetchWithRetry('/api/llm/stream', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(request),
+      signal: timeout.signal,
+    });
+
+    timeout.reset();
+    if (!response.ok) {
+      const data = await parseResponseBody(response);
+      throw new Error(typeof data?.error === 'string' ? data.error : 'LLM stream request failed');
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) {
+      return yield* fallbackStream(request, signal);
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let completedMove: SpymasterMove | OperativeMove | null = null;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      timeout.reset();
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          continue;
+        }
+
+        const event = safeJsonParse(trimmed);
+        if (!event || typeof event !== 'object' || !('type' in event)) {
+          continue;
+        }
+
+        if (event.type === 'reasoning' && typeof event.reasoning === 'string') {
+          emittedReasoning = true;
+          yield {
+            type: 'reasoning',
+            reasoning: event.reasoning,
+          };
+        } else if (event.type === 'complete' && event.move && typeof event.move === 'object') {
+          completedMove = event.move as SpymasterMove | OperativeMove;
+          yield {
+            type: 'complete',
+            move: completedMove,
+          };
+        } else if (event.type === 'error' && typeof event.error === 'string') {
+          throw new Error(event.error);
+        }
+      }
+    }
+
+    if (!completedMove) {
+      return yield* fallbackStream(request, signal, !emittedReasoning);
+    }
+
+    return completedMove;
+  } catch (error) {
+    const normalizedError = timeout.normalizeError(error);
+
+    if (normalizedError instanceof LLMTokenTimeoutError || isAbortLikeError(normalizedError)) {
+      throw normalizedError;
+    }
+
+    return yield* fallbackStream(request, signal, !emittedReasoning);
+  } finally {
+    timeout.dispose();
+  }
+}
+
+async function parseResponseBody(response: Response) {
+  const text = await response.text();
+  if (!text) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { error: text };
+  }
+}
+
+async function* fallbackStream(
+  request: LLMRequest,
+  signal?: AbortSignal,
+  emitReasoning = true,
+): AsyncGenerator<StreamedLLMResponse, SpymasterMove | OperativeMove, void> {
+  const move = await fetchLLMResponse(request, signal);
+  if (emitReasoning) {
+    yield {
+      type: 'reasoning',
+      reasoning: move.reasoning,
+    };
+  }
+  yield {
+    type: 'complete',
+    move,
+  };
+  return move;
+}
+
+function safeJsonParse(text: string) {
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function createIdleTimeout(modelId: string, signal?: AbortSignal) {
+  const controller = new AbortController();
+  const modelLabel = getModelLabel(modelId);
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let timeoutError: LLMTokenTimeoutError | null = null;
+
+  const abortFromParent = () => {
+    controller.abort(signal?.reason);
+  };
+
+  if (signal) {
+    if (signal.aborted) {
+      abortFromParent();
+    } else {
+      signal.addEventListener('abort', abortFromParent, { once: true });
+    }
+  }
+
+  return {
+    signal: controller.signal,
+    reset() {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+
+      timeoutId = setTimeout(() => {
+        timeoutError = new LLMTokenTimeoutError(modelLabel, TOKEN_IDLE_TIMEOUT_MS);
+        controller.abort(timeoutError);
+      }, TOKEN_IDLE_TIMEOUT_MS);
+    },
+    normalizeError(error: unknown) {
+      if (timeoutError && isAbortLikeError(error)) {
+        return timeoutError;
+      }
+
+      return error;
+    },
+    dispose() {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+
+      signal?.removeEventListener('abort', abortFromParent);
+    },
+  };
+}
+
+function getModelLabel(modelId: string) {
+  const model = modelCatalogById[modelId];
+  return model?.shortName || model?.modelName || `Model ${modelId}`;
+}
+
+function isAbortLikeError(error: unknown) {
+  return (
+    (error instanceof DOMException && error.name === 'AbortError') ||
+    (error instanceof Error && error.name === 'AbortError')
+  );
+}
+
+function isTransportError(error: unknown) {
+  return (
+    error instanceof TypeError ||
+    (error instanceof Error && error.message === 'Failed to fetch')
+  );
+}
+
+async function fetchWithRetry(input: RequestInfo | URL, init: RequestInit) {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= NETWORK_RETRY_DELAYS_MS.length; attempt++) {
+    if (attempt > 0) {
+      await sleep(NETWORK_RETRY_DELAYS_MS[attempt - 1]);
+    }
+
+    try {
+      return await fetch(input, init);
+    } catch (error) {
+      if (isAbortLikeError(error) || !isTransportError(error) || attempt === NETWORK_RETRY_DELAYS_MS.length) {
+        throw error;
+      }
+
+      lastError = error;
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error('Failed to fetch');
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
