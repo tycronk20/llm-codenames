@@ -24,6 +24,10 @@ const TOKEN_IDLE_TIMEOUT_MS = 15_000;
 
 export type StreamedLLMResponse =
   | {
+      type: 'progress';
+      tokenCount: number;
+    }
+  | {
       type: 'reasoning';
       reasoning: string;
     }
@@ -32,8 +36,11 @@ export type StreamedLLMResponse =
       move: SpymasterMove | OperativeMove;
     };
 
-export function createMessagesFromGameState(gameState: GameState): Message[] {
-  return [
+export function createMessagesFromGameState(
+  gameState: GameState,
+  assistantPrefill?: string,
+): Message[] {
+  const messages: Message[] = [
     {
       role: 'system',
       content: gameState.currentRole === 'spymaster' ? spySysPrompt : opSysPrompt,
@@ -43,6 +50,15 @@ export function createMessagesFromGameState(gameState: GameState): Message[] {
       content: createUserPrompt(gameState),
     },
   ];
+
+  if (assistantPrefill?.trim()) {
+    messages.push({
+      role: 'assistant',
+      content: assistantPrefill,
+    });
+  }
+
+  return messages;
 }
 
 export async function fetchLLMResponse(
@@ -133,7 +149,12 @@ export async function* streamLLMResponse(
           continue;
         }
 
-        if (event.type === 'reasoning' && typeof event.reasoning === 'string') {
+        if (event.type === 'progress' && typeof event.tokenCount === 'number') {
+          yield {
+            type: 'progress',
+            tokenCount: event.tokenCount,
+          };
+        } else if (event.type === 'reasoning' && typeof event.reasoning === 'string') {
           emittedReasoning = true;
           yield {
             type: 'reasoning',

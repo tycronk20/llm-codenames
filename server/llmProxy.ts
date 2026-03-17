@@ -555,16 +555,22 @@ async function streamOpenAiModel(
   });
   openNdjsonStream(res);
   let reasoningText = '';
+  let streamedText = '';
   let sseEventCount = 0;
   try {
     for await (const event of stream) {
       sseEventCount++;
       if (event.type === 'response.reasoning_summary_text.delta') {
         reasoningText += event.delta;
+        streamedText += event.delta;
+        writeProgressEvent(res, streamedText);
         writeNdjsonEvent(res, {
           type: 'reasoning',
           reasoning: reasoningText,
         });
+      } else if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') {
+        streamedText += event.delta;
+        writeProgressEvent(res, streamedText);
       }
     }
 
@@ -659,6 +665,7 @@ async function streamAnthropicModel(
   openNdjsonStream(res);
   let reasoningText = '';
   let assistantText = '';
+  let streamedText = '';
   let streamedToolInput: Record<string, unknown> | null = null;
   let sseEventCount = 0;
   let stopReason = '';
@@ -726,6 +733,7 @@ async function streamAnthropicModel(
 
         if (event.delta?.type === 'thinking_delta' && typeof event.delta.thinking === 'string') {
           reasoningText += event.delta.thinking;
+          streamedText += event.delta.thinking;
           transcriptEvents.push({
             seq: sseEventCount,
             type: 'thinking_delta',
@@ -733,6 +741,7 @@ async function streamAnthropicModel(
             blockType: block.type,
             text: event.delta.thinking,
           });
+          writeProgressEvent(res, streamedText);
           writeNdjsonEvent(res, {
             type: 'reasoning',
             reasoning: reasoningText,
@@ -742,6 +751,7 @@ async function streamAnthropicModel(
 
         if (event.delta?.type === 'text_delta' && typeof event.delta.text === 'string') {
           block.text += event.delta.text;
+          streamedText += event.delta.text;
           transcriptEvents.push({
             seq: sseEventCount,
             type: 'text_delta',
@@ -749,6 +759,7 @@ async function streamAnthropicModel(
             blockType: block.type,
             text: event.delta.text,
           });
+          writeProgressEvent(res, streamedText);
           continue;
         }
 
@@ -757,6 +768,7 @@ async function streamAnthropicModel(
           typeof event.delta.partial_json === 'string'
         ) {
           block.partialJson += event.delta.partial_json;
+          streamedText += event.delta.partial_json;
           transcriptEvents.push({
             seq: sseEventCount,
             type: 'input_json_delta',
@@ -764,6 +776,7 @@ async function streamAnthropicModel(
             blockType: block.type,
             json: event.delta.partial_json,
           });
+          writeProgressEvent(res, streamedText);
         }
         continue;
       }
@@ -937,6 +950,7 @@ async function streamGoogleModel(
   openNdjsonStream(res);
   let reasoningText = '';
   let outputText = '';
+  let streamedText = '';
   let sseEventCount = 0;
 
   try {
@@ -946,13 +960,20 @@ async function streamGoogleModel(
       const reasoningDelta = extractGoogleThoughtText(chunk, '');
       if (reasoningDelta) {
         reasoningText += reasoningDelta;
+        streamedText += reasoningDelta;
+        writeProgressEvent(res, streamedText);
         writeNdjsonEvent(res, {
           type: 'reasoning',
           reasoning: reasoningText.trimEnd(),
         });
       }
 
-      outputText += getGoogleResponseText(chunk);
+      const outputDelta = getGoogleResponseText(chunk);
+      if (outputDelta) {
+        outputText += outputDelta;
+        streamedText += outputDelta;
+        writeProgressEvent(res, streamedText);
+      }
     }
 
     const parsedMove = parseJsonContent(outputText) as Record<string, unknown>;
@@ -1038,27 +1059,32 @@ async function streamOpenRouterModel(
     });
   }
 
-  const response = await fetchWithTimeout('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: createOpenRouterHeaders(apiKey),
-    body: JSON.stringify(createOpenRouterRequestBody(request, { stream: true })),
-  }, timeoutMs);
-
-  if (!response.ok) {
-    await readApiResponse(response, 'OpenRouter');
-  }
-
-  if (!response.body) {
-    throw new Error('OpenRouter stream response was empty.');
-  }
-
-  openNdjsonStream(res);
+  const inactivityTimeout = createInactivityTimeoutController(request.modelId, timeoutMs);
   let reasoningText = '';
   let outputText = '';
+  let streamedText = '';
   let sseEventCount = 0;
-
   try {
-    for await (const data of readSseData(response.body)) {
+    inactivityTimeout.reset();
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: createOpenRouterHeaders(apiKey),
+      body: JSON.stringify(createOpenRouterRequestBody(request, { stream: true })),
+      signal: inactivityTimeout.signal,
+    });
+
+    inactivityTimeout.reset();
+    if (!response.ok) {
+      await readApiResponse(response, 'OpenRouter');
+    }
+
+    if (!response.body) {
+      throw new Error('OpenRouter stream response was empty.');
+    }
+
+    openNdjsonStream(res);
+
+    for await (const data of readSseData(response.body, { onChunk: inactivityTimeout.reset })) {
       sseEventCount++;
 
       if (data === '[DONE]') {
@@ -1083,13 +1109,20 @@ async function streamOpenRouterModel(
       const reasoningDelta = extractOpenRouterReasoningText(delta, '');
       if (reasoningDelta) {
         reasoningText += reasoningDelta;
+        streamedText += reasoningDelta;
+        writeProgressEvent(res, streamedText);
         writeNdjsonEvent(res, {
           type: 'reasoning',
           reasoning: reasoningText.trimEnd(),
         });
       }
 
-      outputText += extractOpenRouterContentText(delta);
+      const outputDelta = extractOpenRouterContentText(delta);
+      if (outputDelta) {
+        outputText += outputDelta;
+        streamedText += outputDelta;
+        writeProgressEvent(res, streamedText);
+      }
     }
 
     const parsedMove = parseJsonContent(outputText) as Record<string, unknown>;
@@ -1128,6 +1161,7 @@ async function streamOpenRouterModel(
     });
     res.end();
   } catch (error) {
+    const resolvedError = getTimeoutSignalError(inactivityTimeout.signal, error);
     if (requestId) {
       await writeRunLog({
         requestId,
@@ -1141,11 +1175,13 @@ async function streamOpenRouterModel(
         sseEventCount,
         reasoningChars: reasoningText.length,
         outputChars: outputText.length,
-        error: getClientErrorMessage(error, request.modelId, timeoutMs),
+        error: getClientErrorMessage(resolvedError, request.modelId, timeoutMs),
       });
     }
 
-    throw error;
+    throw resolvedError;
+  } finally {
+    inactivityTimeout.dispose();
   }
 }
 
@@ -1697,7 +1733,12 @@ function getOpenRouterChunkError(payload: Record<string, unknown>) {
   return '';
 }
 
-async function* readSseData(stream: ReadableStream<Uint8Array>) {
+async function* readSseData(
+  stream: ReadableStream<Uint8Array>,
+  options?: {
+    onChunk?: () => void;
+  },
+) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -1706,6 +1747,7 @@ async function* readSseData(stream: ReadableStream<Uint8Array>) {
     while (true) {
       const { value, done } = await reader.read();
       if (value) {
+        options?.onChunk?.();
         buffer += decoder.decode(value, { stream: !done });
       }
 
@@ -1885,11 +1927,54 @@ function writeNdjsonEvent(res: ServerResponse<IncomingMessage>, event: unknown) 
   res.write(`${JSON.stringify(event)}\n`);
 }
 
+function writeProgressEvent(res: ServerResponse<IncomingMessage>, streamedText: string) {
+  writeNdjsonEvent(res, {
+    type: 'progress',
+    tokenCount: estimateTokenCount(streamedText),
+  });
+}
+
+function estimateTokenCount(text: string) {
+  const matches = text.match(/\w+|[^\s\w]/g);
+  return matches?.length ?? 0;
+}
+
 function fetchWithTimeout(input: string, init: RequestInit, timeoutMs: number) {
   return fetch(input, {
     ...init,
     signal: AbortSignal.timeout(timeoutMs),
   });
+}
+
+function createInactivityTimeoutController(modelId: string, timeoutMs: number) {
+  const controller = new AbortController();
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeoutError = new DOMException(
+    `Model ${modelId} timed out after ${Math.round(timeoutMs / 1000)}s of inactivity.`,
+    'TimeoutError',
+  );
+
+  return {
+    signal: controller.signal,
+    reset() {
+      if (controller.signal.aborted) {
+        return;
+      }
+
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+
+      timeoutId = setTimeout(() => {
+        controller.abort(timeoutError);
+      }, timeoutMs);
+    },
+    dispose() {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    },
+  };
 }
 
 function getProviderTimeoutMs(modelId: string) {
@@ -1913,6 +1998,10 @@ function getProviderTimeoutMs(modelId: string) {
 
 function getClientErrorMessage(error: unknown, modelId?: string, timeoutMs?: number) {
   if (isTimeoutError(error)) {
+    if (error instanceof Error && /inactivity/i.test(error.message)) {
+      return error.message;
+    }
+
     const modelLabel = modelId ? `Model ${modelId}` : 'The model';
     const seconds = timeoutMs ? Math.round(timeoutMs / 1000) : undefined;
     return seconds ?
@@ -1994,6 +2083,10 @@ function isTimeoutError(error: unknown) {
     (error instanceof DOMException && error.name === 'TimeoutError') ||
     (error instanceof Error && error.name === 'TimeoutError')
   );
+}
+
+function getTimeoutSignalError(signal: AbortSignal, error: unknown) {
+  return signal.aborted && isTimeoutError(signal.reason) ? signal.reason : error;
 }
 
 async function writeRunLog(entry: RequestLogEntry) {

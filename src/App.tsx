@@ -20,10 +20,21 @@ type PendingRequest = {
   role: GameState['currentRole'];
   startedAt: number;
 };
+type PartialChatMessage = {
+  turnKey: string;
+  team: PendingRequest['team'];
+  role: PendingRequest['role'];
+  reasoning: string;
+};
 
-function estimateTokenCount(text: string) {
-  const matches = text.match(/\w+|[^\s\w]/g);
-  return matches?.length ?? 0;
+function createTurnKey(gameState: GameState) {
+  return [
+    gameState.chatHistory.length,
+    gameState.currentTeam,
+    gameState.currentRole,
+    gameState.remainingRed,
+    gameState.remainingBlue,
+  ].join(':');
 }
 
 export default function App() {
@@ -33,11 +44,7 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [idleWarningMessage, setIdleWarningMessage] = useState<string | null>(null);
   const [pendingRequest, setPendingRequest] = useState<PendingRequest | null>(null);
-  const [pendingChatMessage, setPendingChatMessage] = useState<{
-    team: PendingRequest['team'];
-    role: PendingRequest['role'];
-    reasoning: string;
-  } | null>(null);
+  const [pendingChatMessage, setPendingChatMessage] = useState<PartialChatMessage | null>(null);
   const [streamedTokenCount, setStreamedTokenCount] = useState(0);
   const [requestAgeSeconds, setRequestAgeSeconds] = useState(0);
   const chatContainerRef = useRef<HTMLDivElement>(null);
@@ -55,7 +62,6 @@ export default function App() {
       cancelActiveRequest();
       setIdleWarningMessage(null);
       setPendingRequest(null);
-      setPendingChatMessage(null);
       setStreamedTokenCount(0);
       if (appState === 'waiting_for_response') {
         setAppState('ready_for_turn');
@@ -75,13 +81,7 @@ export default function App() {
     }
 
     if (appState === 'ready_for_turn') {
-      const turnKey = [
-        gameState.chatHistory.length,
-        gameState.currentTeam,
-        gameState.currentRole,
-        gameState.remainingRed,
-        gameState.remainingBlue,
-      ].join(':');
+      const turnKey = createTurnKey(gameState);
 
       if (activeTurnKeyRef.current === turnKey) {
         return;
@@ -90,6 +90,8 @@ export default function App() {
       const turnState = gameState;
       const activeModel = turnState.agents[turnState.currentTeam][turnState.currentRole];
       const controller = new AbortController();
+      const assistantPrefill =
+        pendingChatMessage?.turnKey === turnKey ? pendingChatMessage.reasoning : undefined;
       activeTurnKeyRef.current = turnKey;
       activeRequestControllerRef.current = controller;
       setAppState('waiting_for_response');
@@ -99,7 +101,7 @@ export default function App() {
         role: turnState.currentRole,
         startedAt: Date.now(),
       });
-      setPendingChatMessage(null);
+      setPendingChatMessage((current) => current?.turnKey === turnKey ? current : null);
       setErrorMessage(null);
       setIdleWarningMessage(null);
       setStreamedTokenCount(0);
@@ -109,7 +111,7 @@ export default function App() {
           let completedMove: SpymasterMove | OperativeMove | null = null;
           for await (const update of streamLLMResponse(
             {
-              messages: createMessagesFromGameState(turnState),
+              messages: createMessagesFromGameState(turnState, assistantPrefill),
               modelId: activeModel.id,
               role: turnState.currentRole,
             },
@@ -128,13 +130,18 @@ export default function App() {
               return;
             }
 
+            if (update.type === 'progress') {
+              setStreamedTokenCount(update.tokenCount);
+              continue;
+            }
+
             if (update.type === 'reasoning') {
               setPendingChatMessage({
+                turnKey,
                 team: turnState.currentTeam,
                 role: turnState.currentRole,
                 reasoning: update.reasoning,
               });
-              setStreamedTokenCount(estimateTokenCount(update.reasoning));
               continue;
             }
 
@@ -262,7 +269,6 @@ export default function App() {
               cancelActiveRequest();
               setIdleWarningMessage(null);
               setPendingRequest(null);
-              setPendingChatMessage(null);
               setStreamedTokenCount(0);
             }
             if (appState === 'game_over' || appState === 'error') {
@@ -301,13 +307,13 @@ export default function App() {
         {gameState.chatHistory.map((message, index) => (
           <Chat key={index} {...message} />
         ))}
-        {pendingChatMessage && pendingRequest && (
+        {pendingChatMessage && (
           <Chat
             message={pendingChatMessage.reasoning}
             model={gameState.agents[pendingChatMessage.team][pendingChatMessage.role]}
             team={pendingChatMessage.team}
             cards={gameState.cards}
-            isStreaming={true}
+            isStreaming={Boolean(pendingRequest)}
           />
         )}
         {appState === 'game_over' && (
@@ -339,7 +345,6 @@ export default function App() {
                   cancelActiveRequest();
                   setIdleWarningMessage(null);
                   setPendingRequest(null);
-                  setPendingChatMessage(null);
                   setStreamedTokenCount(0);
                   setIsGamePaused(true);
                   setAppState('ready_for_turn');

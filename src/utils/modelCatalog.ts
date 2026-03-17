@@ -122,6 +122,7 @@ export const allModelCatalog = [
     modelName: 'GLM-5',
     shortName: 'GLM-5',
     logoKey: 'openrouter',
+    openRouterReasoningEnabled: true,
   },
   {
     id: 'gpt-5.3-chat',
