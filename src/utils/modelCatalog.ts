@@ -138,8 +138,6 @@ type ModelId = (typeof allModelCatalog)[number]['id'];
 
 export const activeModelIds: readonly ModelId[] = [
   'gemini-3-flash',
-  'gpt-5.4-medium',
-  'claude-sonnet-4.6',
   'kimi-2.5-thinking',
   'grok-4.20-beta',
   'glm-5',

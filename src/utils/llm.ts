@@ -15,17 +15,12 @@ type LLMRequest = {
   role: Role;
 };
 
+type LLMRequestOptions = {
+  onIdleStateChange?: (message: string | null) => void;
+};
+
 const NETWORK_RETRY_DELAYS_MS = [250, 800];
-const TOKEN_IDLE_TIMEOUT_MS = 10_000;
-
-export class LLMTokenTimeoutError extends Error {
-  code = 'LLM_TOKEN_TIMEOUT';
-
-  constructor(modelLabel: string, timeoutMs: number) {
-    super(`${modelLabel} produced no tokens for ${timeoutMs / 1000} seconds. Turn aborted.`);
-    this.name = 'LLMTokenTimeoutError';
-  }
-}
+const TOKEN_IDLE_TIMEOUT_MS = 15_000;
 
 export type StreamedLLMResponse =
   | {
@@ -53,11 +48,12 @@ export function createMessagesFromGameState(gameState: GameState): Message[] {
 export async function fetchLLMResponse(
   request: LLMRequest,
   signal?: AbortSignal,
+  options: LLMRequestOptions = {},
 ): Promise<SpymasterMove | OperativeMove> {
-  const timeout = createIdleTimeout(request.modelId, signal);
+  const idleMonitor = createIdleMonitor(request.modelId, options.onIdleStateChange);
 
   try {
-    timeout.reset();
+    idleMonitor.reset();
 
     const response = await fetchWithRetry('/api/llm', {
       method: 'POST',
@@ -65,32 +61,31 @@ export async function fetchLLMResponse(
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(request),
-      signal: timeout.signal,
+      signal,
     });
 
-    timeout.reset();
+    idleMonitor.reset();
     const data = await parseResponseBody(response);
     if (!response.ok) {
       throw new Error(typeof data?.error === 'string' ? data.error : 'LLM request failed');
     }
 
     return data;
-  } catch (error) {
-    throw timeout.normalizeError(error);
   } finally {
-    timeout.dispose();
+    idleMonitor.dispose();
   }
 }
 
 export async function* streamLLMResponse(
   request: LLMRequest,
   signal?: AbortSignal,
+  options: LLMRequestOptions = {},
 ): AsyncGenerator<StreamedLLMResponse, SpymasterMove | OperativeMove, void> {
   let emittedReasoning = false;
-  const timeout = createIdleTimeout(request.modelId, signal);
+  const idleMonitor = createIdleMonitor(request.modelId, options.onIdleStateChange);
 
   try {
-    timeout.reset();
+    idleMonitor.reset();
 
     const response = await fetchWithRetry('/api/llm/stream', {
       method: 'POST',
@@ -98,10 +93,10 @@ export async function* streamLLMResponse(
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(request),
-      signal: timeout.signal,
+      signal,
     });
 
-    timeout.reset();
+    idleMonitor.reset();
     if (!response.ok) {
       const data = await parseResponseBody(response);
       throw new Error(typeof data?.error === 'string' ? data.error : 'LLM stream request failed');
@@ -109,7 +104,7 @@ export async function* streamLLMResponse(
 
     const reader = response.body?.getReader();
     if (!reader) {
-      return yield* fallbackStream(request, signal);
+      return yield* fallbackStream(request, signal, options);
     }
 
     const decoder = new TextDecoder();
@@ -122,7 +117,7 @@ export async function* streamLLMResponse(
         break;
       }
 
-      timeout.reset();
+      idleMonitor.reset();
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop() ?? '';
@@ -157,20 +152,18 @@ export async function* streamLLMResponse(
     }
 
     if (!completedMove) {
-      return yield* fallbackStream(request, signal, !emittedReasoning);
+      return yield* fallbackStream(request, signal, options, !emittedReasoning);
     }
 
     return completedMove;
   } catch (error) {
-    const normalizedError = timeout.normalizeError(error);
-
-    if (normalizedError instanceof LLMTokenTimeoutError || isAbortLikeError(normalizedError)) {
-      throw normalizedError;
+    if (isAbortLikeError(error)) {
+      throw error;
     }
 
-    return yield* fallbackStream(request, signal, !emittedReasoning);
+    return yield* fallbackStream(request, signal, options, !emittedReasoning);
   } finally {
-    timeout.dispose();
+    idleMonitor.dispose();
   }
 }
 
@@ -190,9 +183,10 @@ async function parseResponseBody(response: Response) {
 async function* fallbackStream(
   request: LLMRequest,
   signal?: AbortSignal,
+  options: LLMRequestOptions = {},
   emitReasoning = true,
 ): AsyncGenerator<StreamedLLMResponse, SpymasterMove | OperativeMove, void> {
-  const move = await fetchLLMResponse(request, signal);
+  const move = await fetchLLMResponse(request, signal, options);
   if (emitReasoning) {
     yield {
       type: 'reasoning',
@@ -214,49 +208,43 @@ function safeJsonParse(text: string) {
   }
 }
 
-function createIdleTimeout(modelId: string, signal?: AbortSignal) {
-  const controller = new AbortController();
+function createIdleMonitor(
+  modelId: string,
+  onIdleStateChange?: (message: string | null) => void,
+) {
   const modelLabel = getModelLabel(modelId);
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  let timeoutError: LLMTokenTimeoutError | null = null;
+  let isIdle = false;
 
-  const abortFromParent = () => {
-    controller.abort(signal?.reason);
+  const clearIdleState = () => {
+    if (!isIdle) {
+      return;
+    }
+
+    isIdle = false;
+    onIdleStateChange?.(null);
   };
 
-  if (signal) {
-    if (signal.aborted) {
-      abortFromParent();
-    } else {
-      signal.addEventListener('abort', abortFromParent, { once: true });
-    }
-  }
-
   return {
-    signal: controller.signal,
     reset() {
       if (timeoutId) {
         clearTimeout(timeoutId);
       }
 
+      clearIdleState();
       timeoutId = setTimeout(() => {
-        timeoutError = new LLMTokenTimeoutError(modelLabel, TOKEN_IDLE_TIMEOUT_MS);
-        controller.abort(timeoutError);
+        isIdle = true;
+        onIdleStateChange?.(
+          `No output from ${modelLabel} for ${TOKEN_IDLE_TIMEOUT_MS / 1000} seconds. Still waiting for a response...`,
+        );
       }, TOKEN_IDLE_TIMEOUT_MS);
-    },
-    normalizeError(error: unknown) {
-      if (timeoutError && isAbortLikeError(error)) {
-        return timeoutError;
-      }
-
-      return error;
     },
     dispose() {
       if (timeoutId) {
         clearTimeout(timeoutId);
       }
 
-      signal?.removeEventListener('abort', abortFromParent);
+      clearIdleState();
     },
   };
 }

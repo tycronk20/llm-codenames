@@ -1,4 +1,4 @@
-import { Loader2, Pause, Play } from 'lucide-react';
+import { Loader2, Pause, Play, Square } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import Card from './components/Card';
 import { Chat } from './components/Chat';
@@ -21,17 +21,24 @@ type PendingRequest = {
   startedAt: number;
 };
 
+function estimateTokenCount(text: string) {
+  const matches = text.match(/\w+|[^\s\w]/g);
+  return matches?.length ?? 0;
+}
+
 export default function App() {
   const [gameState, setGameState] = useState<GameState>(initializeGameState());
   const [appState, setAppState] = useState<AppState>('game_start');
   const [isGamePaused, setIsGamePaused] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [idleWarningMessage, setIdleWarningMessage] = useState<string | null>(null);
   const [pendingRequest, setPendingRequest] = useState<PendingRequest | null>(null);
   const [pendingChatMessage, setPendingChatMessage] = useState<{
     team: PendingRequest['team'];
     role: PendingRequest['role'];
     reasoning: string;
   } | null>(null);
+  const [streamedTokenCount, setStreamedTokenCount] = useState(0);
   const [requestAgeSeconds, setRequestAgeSeconds] = useState(0);
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const activeTurnKeyRef = useRef<string | null>(null);
@@ -46,8 +53,10 @@ export default function App() {
   useEffect(() => {
     if (isGamePaused) {
       cancelActiveRequest();
+      setIdleWarningMessage(null);
       setPendingRequest(null);
       setPendingChatMessage(null);
+      setStreamedTokenCount(0);
       if (appState === 'waiting_for_response') {
         setAppState('ready_for_turn');
       }
@@ -56,8 +65,10 @@ export default function App() {
 
     if (gameState.gameWinner) {
       cancelActiveRequest();
+      setIdleWarningMessage(null);
       setPendingRequest(null);
       setPendingChatMessage(null);
+      setStreamedTokenCount(0);
       setIsGamePaused(true);
       setAppState('game_over');
       return;
@@ -90,6 +101,8 @@ export default function App() {
       });
       setPendingChatMessage(null);
       setErrorMessage(null);
+      setIdleWarningMessage(null);
+      setStreamedTokenCount(0);
 
       void (async () => {
         try {
@@ -101,6 +114,15 @@ export default function App() {
               role: turnState.currentRole,
             },
             controller.signal,
+            {
+              onIdleStateChange: (message) => {
+                if (activeRequestControllerRef.current !== controller || controller.signal.aborted) {
+                  return;
+                }
+
+                setIdleWarningMessage(message);
+              },
+            },
           )) {
             if (activeRequestControllerRef.current !== controller || controller.signal.aborted) {
               return;
@@ -112,6 +134,7 @@ export default function App() {
                 role: turnState.currentRole,
                 reasoning: update.reasoning,
               });
+              setStreamedTokenCount(estimateTokenCount(update.reasoning));
               continue;
             }
 
@@ -127,6 +150,8 @@ export default function App() {
 
           setPendingRequest(null);
           setPendingChatMessage(null);
+          setIdleWarningMessage(null);
+          setStreamedTokenCount(0);
           if (turnState.currentRole === 'spymaster') {
             setGameState(updateGameStateFromSpymasterMove(turnState, completedMove as SpymasterMove));
           } else {
@@ -141,6 +166,8 @@ export default function App() {
           console.error('Error in fetchResponse:', error);
           setPendingRequest(null);
           setPendingChatMessage(null);
+          setIdleWarningMessage(null);
+          setStreamedTokenCount(0);
           setErrorMessage(
             error instanceof Error ?
               error.message
@@ -200,6 +227,11 @@ export default function App() {
             {errorMessage ?? 'An error occurred. Please reload the game.'}
           </div>
         )}
+        {idleWarningMessage && appState !== 'error' && (
+          <div className='fixed left-4 top-4 z-50 rounded-md bg-amber-500 px-4 py-2 text-slate-950 shadow-lg'>
+            {idleWarningMessage}
+          </div>
+        )}
 
         {/* Scoreboard */}
         <Scoreboard gameState={gameState} />
@@ -228,15 +260,19 @@ export default function App() {
 
             if (shouldResetGame || nextPausedState) {
               cancelActiveRequest();
+              setIdleWarningMessage(null);
               setPendingRequest(null);
               setPendingChatMessage(null);
+              setStreamedTokenCount(0);
             }
             if (appState === 'game_over' || appState === 'error') {
               setGameState(initializeGameState());
               setAppState('game_start');
               setErrorMessage(null);
+              setIdleWarningMessage(null);
               setPendingRequest(null);
               setPendingChatMessage(null);
+              setStreamedTokenCount(0);
             }
             setIsGamePaused(nextPausedState);
           }}
@@ -292,8 +328,27 @@ export default function App() {
                 <span className='text-[11px] font-medium uppercase tracking-[0.16em] text-slate-400'>
                   {pendingRequest?.team} {pendingRequest?.role} · {requestAgeSeconds}s
                 </span>
+                <span className='text-[11px] font-medium uppercase tracking-[0.16em] text-slate-500'>
+                  ~{streamedTokenCount} tok streamed
+                </span>
               </div>
               <Loader2 className='size-4 animate-spin text-slate-200' />
+              <button
+                type='button'
+                onClick={() => {
+                  cancelActiveRequest();
+                  setIdleWarningMessage(null);
+                  setPendingRequest(null);
+                  setPendingChatMessage(null);
+                  setStreamedTokenCount(0);
+                  setIsGamePaused(true);
+                  setAppState('ready_for_turn');
+                }}
+                className='flex items-center gap-1 rounded-full border border-rose-400/40 bg-rose-500/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-rose-100 transition hover:bg-rose-500/20'
+              >
+                <Square className='size-3 fill-current' />
+                Stop
+              </button>
             </div>
           </div>
         )}
