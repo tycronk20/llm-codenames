@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { appendFile, mkdir, writeFile } from 'node:fs/promises';
 import { IncomingMessage, ServerResponse } from 'node:http';
+import { OpenRouter } from '@openrouter/sdk';
 import { createRequire } from 'node:module';
 import { jsonrepair } from 'jsonrepair';
 import { modelCatalogById, type Provider } from '../src/utils/modelCatalog.ts';
@@ -8,6 +9,7 @@ import { modelCatalogById, type Provider } from '../src/utils/modelCatalog.ts';
 type Message = {
   role: 'system' | 'user' | 'assistant';
   content: string;
+  reasoningDetails?: OpenRouterReasoningDetail[];
 };
 
 type MoveRole = 'spymaster' | 'operative';
@@ -19,6 +21,7 @@ type LlmApiRequest = {
 };
 
 type JsonObject = Record<string, unknown>;
+type OpenRouterReasoningDetail = Record<string, unknown>;
 type AnthropicThinkingConfig = NonNullable<
   (typeof modelCatalogById)[string]['anthropicThinking']
 >;
@@ -74,6 +77,24 @@ type RequestLogEntry = {
   sseEventCount?: number;
   outputChars?: number;
   stopReason?: string;
+  guesses?: string[];
+  gameSnapshot?: {
+    currentTeam?: string;
+    currentRole?: string;
+    remainingRed?: number;
+    remainingBlue?: number;
+    clueText?: string;
+    clueNumber?: number;
+    cardCount?: number;
+    revealedCount?: number;
+    recentlyRevealedCount?: number;
+    board?: Array<{
+      word: string;
+      color?: string;
+      isRevealed?: boolean;
+      wasRecentlyRevealed?: boolean;
+    }>;
+  };
 };
 
 const moveSchemas: Record<MoveRole, JsonObject> = {
@@ -214,6 +235,38 @@ export function createLlmApiMiddleware(env: Record<string, string>) {
       return;
     }
 
+    if (req.method === 'POST' && req.url === '/api/config/active-models') {
+      try {
+        const body = await readJsonBody(req);
+        if (!body || !Array.isArray(body.activeModelIds)) {
+          throw new Error('Invalid request payload.');
+        }
+
+        const fs = await import('node:fs/promises');
+        const catalogPath = new URL('../src/utils/modelCatalog.ts', import.meta.url);
+        const content = await fs.readFile(catalogPath, 'utf8');
+        
+        const formattedIds = body.activeModelIds.map((id: string) => `  '${id}',`).join('\n');
+        const newContent = content.replace(
+          /export const activeModelIds: readonly ModelId\[\] = \[[^\]]*\];/,
+          `export const activeModelIds: readonly ModelId[] = [\n${formattedIds}\n];`
+        );
+        
+        await fs.writeFile(catalogPath, newContent, 'utf8');
+        
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ success: true }));
+      } catch (error) {
+        console.error('[llm-proxy] active models config failed:', error);
+        res.statusCode = 500;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: String(error) }));
+      }
+
+      return;
+    }
+
     if (req.method !== 'POST' || req.url !== '/api/llm') {
       next();
       return;
@@ -339,7 +392,7 @@ async function fetchStructuredMove(
       model.provider === 'openai' ? await callOpenAiModel(request, env)
       : model.provider === 'anthropic' ? await callAnthropicModel(request, env)
       : model.provider === 'google' ? await callGoogleModel(request, env)
-      : await callOpenRouterModel(request, env);
+      : await callOpenRouterModel(request, env, requestId);
 
     if (requestId) {
       await writeRunLog({
@@ -512,21 +565,25 @@ async function callGoogleModel(request: LlmApiRequest, env: Record<string, strin
   return parseGoogleGenerateContentPayload(response);
 }
 
-async function callOpenRouterModel(request: LlmApiRequest, env: Record<string, string>) {
-  const apiKey = pickEnvValue(env, ['OPENROUTER_API_KEY'], /^OPENROUTER_API_KEY(_.+)?$/);
-  if (!apiKey) {
-    throw new Error('Missing OpenRouter API key. Set OPENROUTER_API_KEY.');
-  }
+async function callOpenRouterModel(
+  request: LlmApiRequest,
+  env: Record<string, string>,
+  requestId?: string,
+) {
+  const client = createOpenRouterClient(request.modelId, env);
+  const response = await client.chat.send(
+    {
+      chatGenerationParams:
+        createOpenRouterChatParams(request) as import('@openrouter/sdk/models').ChatGenerationParams & {
+          stream?: false;
+        },
+    },
+    {
+      timeoutMs: getProviderTimeoutMs(request.modelId),
+    },
+  );
 
-  const timeoutMs = getProviderTimeoutMs(request.modelId);
-  const response = await fetchWithTimeout('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: createOpenRouterHeaders(apiKey),
-    body: JSON.stringify(createOpenRouterRequestBody(request)),
-  }, timeoutMs);
-
-  const data = await readApiResponse(response, 'OpenRouter');
-  return parseOpenRouterChatPayload(data);
+  return resolveOpenRouterMove(request, env, response, requestId);
 }
 
 async function streamOpenAiModel(
@@ -922,6 +979,28 @@ async function recoverAnthropicMoveFromNonStream(
   return callAnthropicModel(request, env);
 }
 
+async function recoverOpenRouterMoveFromNonStream(
+  request: LlmApiRequest,
+  env: Record<string, string>,
+  requestId?: string,
+  reason?: string,
+) {
+  if (requestId) {
+    await writeRunLog({
+      requestId,
+      event: 'provider_fallback_nonstream',
+      modelId: request.modelId,
+      provider: 'openrouter',
+      role: request.role,
+      stream: true,
+      stopReason: reason || 'missing_move',
+    });
+  }
+
+  const rawMove = await callOpenRouterModel(request, env, requestId);
+  return normalizeMove(request.role, rawMove);
+}
+
 async function streamGoogleModel(
   request: LlmApiRequest,
   env: Record<string, string>,
@@ -976,11 +1055,11 @@ async function streamGoogleModel(
       }
     }
 
-    const parsedMove = parseJsonContent(outputText) as Record<string, unknown>;
-    const streamedReasoning = reasoningText.trim();
-    const move = normalizeMove(request.role, {
-      ...parsedMove,
-      reasoning: streamedReasoning || parsedMove.reasoning,
+    const move = await resolveMoveWithFormatRepair(request, env, {
+      requestId,
+      source: 'google_stream',
+      output: outputText,
+      reasoning: reasoningText.trim(),
     });
 
     if (requestId) {
@@ -999,7 +1078,7 @@ async function streamGoogleModel(
       });
     }
 
-    if (!streamedReasoning) {
+    if (!reasoningText.trim()) {
       writeNdjsonEvent(res, {
         type: 'reasoning',
         reasoning: move.reasoning,
@@ -1040,11 +1119,7 @@ async function streamOpenRouterModel(
   requestId?: string,
 ) {
   const model = modelCatalogById[request.modelId];
-  const apiKey = pickEnvValue(env, ['OPENROUTER_API_KEY'], /^OPENROUTER_API_KEY(_.+)?$/);
-  if (!apiKey) {
-    throw new Error('Missing OpenRouter API key. Set OPENROUTER_API_KEY.');
-  }
-
+  const client = createOpenRouterClient(request.modelId, env);
   const timeoutMs = getProviderTimeoutMs(request.modelId);
   const startedAt = Date.now();
   if (requestId) {
@@ -1062,48 +1137,80 @@ async function streamOpenRouterModel(
   const inactivityTimeout = createInactivityTimeoutController(request.modelId, timeoutMs);
   let reasoningText = '';
   let outputText = '';
+  const reasoningDetails: OpenRouterReasoningDetail[] = [];
   let streamedText = '';
   let sseEventCount = 0;
   try {
     inactivityTimeout.reset();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: createOpenRouterHeaders(apiKey),
-      body: JSON.stringify(createOpenRouterRequestBody(request, { stream: true })),
-      signal: inactivityTimeout.signal,
-    });
+    const streamOrResponse = await client.chat.send(
+      {
+        chatGenerationParams:
+          createOpenRouterChatParams(request, { stream: true }) as import('@openrouter/sdk/models').ChatGenerationParams & {
+            stream: true;
+          },
+      },
+      {
+        timeoutMs,
+        signal: inactivityTimeout.signal,
+      },
+    );
 
     inactivityTimeout.reset();
-    if (!response.ok) {
-      await readApiResponse(response, 'OpenRouter');
-    }
 
-    if (!response.body) {
-      throw new Error('OpenRouter stream response was empty.');
+    if (!isAsyncIterable(streamOrResponse)) {
+      const move = await resolveOpenRouterMove(request, env, streamOrResponse, requestId);
+      openNdjsonStream(res);
+      writeNdjsonEvent(res, {
+        type: 'reasoning',
+        reasoning: move.reasoning,
+      });
+      writeNdjsonEvent(res, {
+        type: 'complete',
+        move,
+      });
+      res.end();
+
+      if (requestId) {
+        await writeRunLog({
+          requestId,
+          event: 'provider_succeeded',
+          modelId: request.modelId,
+          provider: model?.provider,
+          role: request.role,
+          stream: true,
+          durationMs: Date.now() - startedAt,
+          timeoutMs,
+          sseEventCount,
+          ...summarizeMove(move),
+        });
+      }
+
+      return;
     }
 
     openNdjsonStream(res);
 
-    for await (const data of readSseData(response.body, { onChunk: inactivityTimeout.reset })) {
+    for await (const chunk of streamOrResponse) {
+      inactivityTimeout.reset();
       sseEventCount++;
 
-      if (data === '[DONE]') {
-        break;
-      }
-
-      const chunk = safeJsonParse(data);
       if (!chunk || typeof chunk !== 'object') {
         continue;
       }
 
-      const chunkError = getOpenRouterChunkError(chunk);
+      const chunkError = getOpenRouterChunkError(chunk as Record<string, unknown>);
       if (chunkError) {
         throw new Error(`OpenRouter API error: ${chunkError}`);
       }
 
-      const delta = getOpenRouterChoiceDelta(chunk);
+      const delta = getOpenRouterChoiceDelta(chunk as Record<string, unknown>);
       if (!delta) {
         continue;
+      }
+
+      const reasoningDetailsDelta = getOpenRouterReasoningDetails(delta);
+      if (reasoningDetailsDelta.length > 0) {
+        reasoningDetails.push(...reasoningDetailsDelta);
       }
 
       const reasoningDelta = extractOpenRouterReasoningText(delta, '');
@@ -1123,14 +1230,28 @@ async function streamOpenRouterModel(
         streamedText += outputDelta;
         writeProgressEvent(res, streamedText);
       }
+
+      if (reasoningDetailsDelta.length > 0 || outputDelta) {
+        writeNdjsonEvent(res, {
+          type: 'prefill',
+          prefill: {
+            content: outputText,
+            reasoning: reasoningText.trimEnd(),
+            reasoningDetails,
+          },
+        });
+      }
     }
 
-    const parsedMove = parseJsonContent(outputText) as Record<string, unknown>;
-    const streamedReasoning = reasoningText.trim();
-    const move = normalizeMove(request.role, {
-      ...parsedMove,
-      reasoning: streamedReasoning || parsedMove.reasoning,
-    });
+    const move =
+      outputText.trim() ?
+        await resolveMoveWithFormatRepair(request, env, {
+          requestId,
+          source: 'openrouter_stream',
+          output: outputText,
+          reasoning: reasoningText.trim(),
+        })
+      : await recoverOpenRouterMoveFromNonStream(request, env, requestId, 'empty_stream_output');
 
     if (requestId) {
       await writeRunLog({
@@ -1148,7 +1269,7 @@ async function streamOpenRouterModel(
       });
     }
 
-    if (!streamedReasoning) {
+    if (!reasoningText.trim()) {
       writeNdjsonEvent(res, {
         type: 'reasoning',
         reasoning: move.reasoning,
@@ -1162,6 +1283,50 @@ async function streamOpenRouterModel(
     res.end();
   } catch (error) {
     const resolvedError = getTimeoutSignalError(inactivityTimeout.signal, error);
+    if (res.headersSent && !res.writableEnded) {
+      try {
+        const move = await recoverOpenRouterMoveFromNonStream(
+          request,
+          env,
+          requestId,
+          error instanceof Error ? error.message : 'stream_failed',
+        );
+
+        if (!reasoningText.trim()) {
+          writeNdjsonEvent(res, {
+            type: 'reasoning',
+            reasoning: move.reasoning,
+          });
+        }
+
+        writeNdjsonEvent(res, {
+          type: 'complete',
+          move,
+        });
+        res.end();
+
+        if (requestId) {
+          await writeRunLog({
+            requestId,
+            event: 'provider_succeeded',
+            modelId: request.modelId,
+            provider: model?.provider,
+            role: request.role,
+            stream: true,
+            durationMs: Date.now() - startedAt,
+            timeoutMs,
+            sseEventCount,
+            outputChars: outputText.length,
+            ...summarizeMove(move),
+          });
+        }
+
+        return;
+      } catch {
+        // Fall through to the shared stream recovery path below.
+      }
+    }
+
     if (requestId) {
       await writeRunLog({
         requestId,
@@ -1242,7 +1407,7 @@ function createAnthropicRequestBody(
 
   return {
     model: model.apiModel,
-    max_tokens: 1024,
+    max_tokens: 10024,
     ...(system ? { system } : {}),
     messages,
     tools: [
@@ -1391,16 +1556,21 @@ function createGoogleGenerateContentParams(
   };
 }
 
-function createOpenRouterHeaders(apiKey: string) {
-  return {
-    'Authorization': `Bearer ${apiKey}`,
-    'Content-Type': 'application/json',
-    'HTTP-Referer': 'https://llmcodenames.local',
-    'X-Title': 'LLM Codenames',
-  };
+function createOpenRouterClient(modelId: string, env: Record<string, string>) {
+  const apiKey = pickEnvValue(env, ['OPENROUTER_API_KEY'], /^OPENROUTER_API_KEY(_.+)?$/);
+  if (!apiKey) {
+    throw new Error('Missing OpenRouter API key. Set OPENROUTER_API_KEY.');
+  }
+
+  return new OpenRouter({
+    apiKey,
+    httpReferer: 'https://llmcodenames.local',
+    xTitle: 'LLM Codenames',
+    timeoutMs: getProviderTimeoutMs(modelId),
+  });
 }
 
-function createOpenRouterRequestBody(
+function createOpenRouterChatParams(
   request: LlmApiRequest,
   options?: {
     stream?: boolean;
@@ -1408,16 +1578,45 @@ function createOpenRouterRequestBody(
 ) {
   const model = modelCatalogById[request.modelId];
   const stream = options?.stream ?? false;
+  const reasoningConfig: {
+    effort?: NonNullable<(typeof modelCatalogById)[string]['openRouterReasoningEffort']>;
+  } = {};
+
+  if (model.openRouterReasoningEffort) {
+    reasoningConfig.effort = model.openRouterReasoningEffort;
+  } else if (model.openRouterReasoningEnabled) {
+    reasoningConfig.effort = 'medium';
+  }
 
   return {
     model: model.apiModel,
-    messages: request.messages,
-    response_format: {
-      type: 'json_object',
+    maxTokens: 4096,
+    messages:
+      request.messages.map((message) =>
+        message.role === 'assistant' ?
+          {
+            role: 'assistant' as const,
+            content: message.content,
+            ...(message.reasoningDetails?.length ?
+              {
+                reasoningDetails: message.reasoningDetails,
+              }
+            : {}),
+          }
+        : {
+            role: message.role,
+            content: message.content,
+          },
+      ) as unknown as import('@openrouter/sdk/models').Message[],
+    provider: {
+      allowFallbacks: true,
+    },
+    responseFormat: {
+      type: 'json_object' as const,
     },
     ...(stream ? { stream: true } : {}),
-    ...(!stream ? { plugins: [{ id: 'response-healing' }] } : {}),
-    ...(model.openRouterReasoningEnabled ? { reasoning: { enabled: true } } : {}),
+    ...(!stream ? { plugins: [{ id: 'response-healing' as const }] } : {}),
+    ...(Object.keys(reasoningConfig).length > 0 ? { reasoning: reasoningConfig } : {}),
   };
 }
 
@@ -1508,6 +1707,189 @@ function parseOpenRouterChatPayload(payload: unknown) {
   }
 
   return parsedMove;
+}
+
+async function resolveOpenRouterMove(
+  request: LlmApiRequest,
+  env: Record<string, string>,
+  payload: unknown,
+  requestId?: string,
+) {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('OpenRouter response payload was empty.');
+  }
+
+  const response = payload as Record<string, unknown>;
+  const message = getOpenRouterChoiceMessage(response);
+
+  return resolveMoveWithFormatRepair(request, env, {
+    requestId,
+    source: 'openrouter_nonstream',
+    output: message?.content,
+    reasoning: extractOpenRouterReasoningText(message, '\n\n').trim(),
+  });
+}
+
+async function resolveMoveWithFormatRepair(
+  request: LlmApiRequest,
+  env: Record<string, string>,
+  options: {
+    output: unknown;
+    reasoning?: string;
+    requestId?: string;
+    source: string;
+  },
+) {
+  try {
+    const parsedMove = parseJsonContent(options.output) as Record<string, unknown>;
+    return normalizeMove(request.role, {
+      ...parsedMove,
+      reasoning: options.reasoning || parsedMove.reasoning,
+    });
+  } catch (error) {
+    return repairMoveFormatWithQwen(request, env, {
+      requestId: options.requestId,
+      source: options.source,
+      output: options.output,
+      reasoning: options.reasoning,
+      originalError: error,
+    });
+  }
+}
+
+async function repairMoveFormatWithQwen(
+  request: LlmApiRequest,
+  env: Record<string, string>,
+  options: {
+    output: unknown;
+    reasoning?: string;
+    requestId?: string;
+    source: string;
+    originalError: unknown;
+  },
+) {
+  const apiKey = pickEnvValue(env, ['OPENROUTER_API_KEY'], /^OPENROUTER_API_KEY(_.+)?$/);
+  if (!apiKey) {
+    throw options.originalError;
+  }
+
+  if (options.requestId) {
+    await writeRunLog({
+      requestId: options.requestId,
+      event: 'format_repair_started',
+      modelId: request.modelId,
+      provider: modelCatalogById[request.modelId]?.provider,
+      role: request.role,
+      error: `${options.source}: ${getClientErrorMessage(
+        options.originalError,
+        request.modelId,
+        getProviderTimeoutMs(request.modelId),
+      )}`,
+    });
+  }
+
+  const client = createOpenRouterClient(request.modelId, env);
+  const repairReasoning: {
+    effort?: 'medium';
+  } = {
+    effort: 'medium',
+  };
+  const response = await client.chat.send(
+    {
+      chatGenerationParams: {
+        model: 'x-ai/grok-4.1-fast',
+        maxTokens: 600,
+        messages: createRepairMessages(request, options).map((message) => ({
+          role: message.role,
+          content: message.content,
+        })),
+        provider: {
+          allowFallbacks: true,
+        },
+        responseFormat: {
+          type: 'json_object' as const,
+        },
+        plugins: [{ id: 'response-healing' as const }],
+        reasoning: repairReasoning,
+      },
+    },
+    {
+      timeoutMs: 60_000,
+    },
+  );
+
+  const repairedPayload = parseOpenRouterChatPayload(response);
+  const repairedMove = normalizeMove(request.role, repairedPayload);
+
+  if (options.requestId) {
+    await writeRunLog({
+      requestId: options.requestId,
+      event: 'format_repair_succeeded',
+      modelId: request.modelId,
+      provider: modelCatalogById[request.modelId]?.provider,
+      role: request.role,
+      ...summarizeMove(repairedMove),
+    });
+  }
+
+  return repairedMove;
+}
+
+function createRepairMessages(
+  request: LlmApiRequest,
+  options: {
+    output: unknown;
+    reasoning?: string;
+    source: string;
+    originalError: unknown;
+  },
+): Message[] {
+  return [
+    {
+      role: 'system',
+      content:
+        'You repair malformed model outputs for a Codenames engine. Return exactly one JSON object and nothing else. Preserve the original answer semantics. Only extract and normalize fields from the supplied output and reasoning. Do not improve the move.',
+    },
+    {
+      role: 'user',
+      content: [
+        `role: ${request.role}`,
+        `required_schema: ${JSON.stringify(moveSchemas[request.role])}`,
+        `source: ${options.source}`,
+        `original_model_id: ${request.modelId}`,
+        `original_error: ${getClientErrorMessage(options.originalError, request.modelId, getProviderTimeoutMs(request.modelId))}`,
+        `assistant_output:\n${serializeRepairSource(options.output) || '(empty)'}`,
+        `assistant_reasoning:\n${options.reasoning?.trim() || '(empty)'}`,
+        'Return only the repaired JSON object.',
+      ].join('\n\n'),
+    },
+  ];
+}
+
+function serializeRepairSource(output: unknown) {
+  if (typeof output === 'string') {
+    return output.trim();
+  }
+
+  if (Array.isArray(output)) {
+    const text = output
+      .map((part) =>
+        typeof part === 'string' ? part
+        : part && typeof part === 'object' && 'text' in part && typeof part.text === 'string' ?
+          part.text
+        : JSON.stringify(part)
+      )
+      .filter(Boolean)
+      .join('\n');
+
+    return text.trim();
+  }
+
+  if (output && typeof output === 'object') {
+    return JSON.stringify(output, null, 2);
+  }
+
+  return '';
 }
 
 function normalizeMove(role: MoveRole, rawMove: unknown) {
@@ -1622,12 +2004,26 @@ function extractOpenRouterReasoningText(payload: Record<string, unknown> | undef
     return '';
   }
 
-  const detailsText = extractOpenRouterReasoningDetailsText(payload.reasoning_details, joiner);
+  const detailsText = extractOpenRouterReasoningDetailsText(
+    payload.reasoningDetails ?? payload.reasoning_details,
+    joiner,
+  );
   if (detailsText) {
     return detailsText;
   }
 
   return typeof payload.reasoning === 'string' ? payload.reasoning : '';
+}
+
+function getOpenRouterReasoningDetails(payload: Record<string, unknown> | undefined) {
+  const reasoningDetails = payload?.reasoningDetails ?? payload?.reasoning_details;
+  if (!Array.isArray(reasoningDetails)) {
+    return [];
+  }
+
+  return reasoningDetails
+    .filter((detail): detail is OpenRouterReasoningDetail => !!detail && typeof detail === 'object')
+    .map((detail) => ({ ...detail }));
 }
 
 function extractGoogleThoughtText(payload: unknown, joiner: string) {
@@ -1693,6 +2089,17 @@ function extractOpenRouterReasoningDetailsText(reasoningDetails: unknown, joiner
         return '';
       }
 
+      if ('summary' in detail && Array.isArray(detail.summary)) {
+        return detail.summary
+          .map((part: unknown) =>
+            part && typeof part === 'object' && 'text' in part && typeof part.text === 'string' ?
+              part.text
+            : '',
+          )
+          .filter(Boolean)
+          .join(joiner);
+      }
+
       return 'text' in detail && typeof detail.text === 'string' ? detail.text : '';
     })
     .filter(Boolean)
@@ -1731,6 +2138,10 @@ function getOpenRouterChunkError(payload: Record<string, unknown>) {
   }
 
   return '';
+}
+
+function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
+  return !!value && typeof value === 'object' && Symbol.asyncIterator in value;
 }
 
 async function* readSseData(
@@ -1846,6 +2257,13 @@ function parseMessage(message: unknown): Message {
   return {
     role: parsed.role,
     content: parsed.content,
+    ...(Array.isArray(parsed.reasoningDetails) ?
+      {
+        reasoningDetails: parsed.reasoningDetails
+          .filter((detail): detail is OpenRouterReasoningDetail => !!detail && typeof detail === 'object')
+          .map((detail) => ({ ...detail })),
+      }
+    : {}),
   };
 }
 
@@ -2013,12 +2431,14 @@ function getClientErrorMessage(error: unknown, modelId?: string, timeoutMs?: num
 }
 
 function summarizeMessages(messages: Message[]) {
+  const gameSnapshot = extractGameSnapshot(messages);
   const summary = {
     messageCount: messages.length,
     messageChars: 0,
     systemChars: 0,
     userChars: 0,
     assistantChars: 0,
+    ...(gameSnapshot ? { gameSnapshot } : {}),
   };
 
   for (const message of messages) {
@@ -2035,6 +2455,103 @@ function summarizeMessages(messages: Message[]) {
   }
 
   return summary;
+}
+
+function extractGameSnapshot(messages: Message[]) {
+  const userMessage = messages.find((message) => message.role === 'user')?.content;
+  if (!userMessage) {
+    return undefined;
+  }
+
+  const board = parseBoardSnapshot(userMessage);
+  const currentTeam = readPromptLine(userMessage, 'Your Team');
+  const currentRole = readPromptLine(userMessage, 'Your Role');
+  const remainingRed = readPromptInteger(userMessage, 'Red Cards Left to Guess');
+  const remainingBlue = readPromptInteger(userMessage, 'Blue Cards Left to Guess');
+  const clueText = readPromptLine(userMessage, 'Your Clue');
+  const clueNumber = readPromptInteger(userMessage, 'Number');
+
+  if (
+    !board &&
+    currentTeam === undefined &&
+    currentRole === undefined &&
+    remainingRed === undefined &&
+    remainingBlue === undefined &&
+    clueText === undefined &&
+    clueNumber === undefined
+  ) {
+    return undefined;
+  }
+
+  return {
+    ...(currentTeam ? { currentTeam } : {}),
+    ...(currentRole ? { currentRole } : {}),
+    ...(remainingRed !== undefined ? { remainingRed } : {}),
+    ...(remainingBlue !== undefined ? { remainingBlue } : {}),
+    ...(clueText ? { clueText } : {}),
+    ...(clueNumber !== undefined ? { clueNumber } : {}),
+    ...(board ?
+      {
+        board,
+        cardCount: board.length,
+        revealedCount: board.filter((card) => card.isRevealed).length,
+        recentlyRevealedCount: board.filter((card) => card.wasRecentlyRevealed).length,
+      }
+    : {}),
+  };
+}
+
+function parseBoardSnapshot(userMessage: string) {
+  const boardMarker = 'Board:';
+  const boardStart = userMessage.indexOf(boardMarker);
+  if (boardStart === -1) {
+    return undefined;
+  }
+
+  const boardWithTrailingPrompt = userMessage.slice(boardStart + boardMarker.length);
+  const clueMarkerIndex = boardWithTrailingPrompt.indexOf('\n\n  Your Clue:');
+  const boardText =
+    clueMarkerIndex === -1 ? boardWithTrailingPrompt.trim() : boardWithTrailingPrompt.slice(0, clueMarkerIndex).trim();
+
+  try {
+    const parsed = JSON.parse(boardText);
+    if (!Array.isArray(parsed)) {
+      return undefined;
+    }
+
+    return parsed
+      .filter((card): card is Record<string, unknown> => Boolean(card) && typeof card === 'object')
+      .map((card) => ({
+        word: typeof card.word === 'string' ? card.word : '',
+        ...(typeof card.color === 'string' ? { color: card.color } : {}),
+        ...(typeof card.isRevealed === 'boolean' ? { isRevealed: card.isRevealed } : {}),
+        ...(typeof card.wasRecentlyRevealed === 'boolean' ?
+          { wasRecentlyRevealed: card.wasRecentlyRevealed }
+        : {}),
+      }))
+      .filter((card) => card.word);
+  } catch {
+    return undefined;
+  }
+}
+
+function readPromptLine(userMessage: string, label: string) {
+  const match = userMessage.match(new RegExp(`^${escapeRegExp(label)}:\\s*(.+)$`, 'm'));
+  return match?.[1]?.trim() || undefined;
+}
+
+function readPromptInteger(userMessage: string, label: string) {
+  const rawValue = readPromptLine(userMessage, label);
+  if (!rawValue) {
+    return undefined;
+  }
+
+  const parsed = Number.parseInt(rawValue, 10);
+  return Number.isInteger(parsed) ? parsed : undefined;
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function summarizeRawResult(rawResult: unknown) {
@@ -2057,7 +2574,9 @@ function summarizeRawResult(rawResult: unknown) {
     summary.number = result.number;
   }
   if (Array.isArray(result.guesses)) {
-    summary.guessCount = result.guesses.filter((guess) => typeof guess === 'string').length;
+    const guesses = result.guesses.filter((guess): guess is string => typeof guess === 'string');
+    summary.guessCount = guesses.length;
+    summary.guesses = guesses;
   }
 
   return summary;
@@ -2073,6 +2592,7 @@ function summarizeMove(move: ReturnType<typeof normalizeMove>) {
     summary.number = move.number;
   } else {
     summary.guessCount = move.guesses.length;
+    summary.guesses = move.guesses;
   }
 
   return summary;

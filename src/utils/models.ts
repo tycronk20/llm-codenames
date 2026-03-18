@@ -1,4 +1,5 @@
 import anthropicLogo from '../assets/logos/anthropic.svg';
+import deepseekLogo from '../assets/logos/deepseek.svg';
 import geminiLogo from '../assets/logos/gemini.svg';
 import openaiLogo from '../assets/logos/openai.svg';
 import openrouterLogo from '../assets/logos/openrouter.svg';
@@ -11,6 +12,7 @@ export type LLMModel = LLMModelConfig & {
 
 const logoByKey: Record<LogoKey, string> = {
   anthropic: anthropicLogo,
+  deepseek: deepseekLogo,
   gemini: geminiLogo,
   openai: openaiLogo,
   openrouter: openrouterLogo,
@@ -21,3 +23,7 @@ export const agents: LLMModel[] = modelCatalog.map((model) => ({
   ...model,
   logo: logoByKey[model.logoKey],
 }));
+
+export const agentsById: Record<string, LLMModel> = Object.fromEntries(
+  agents.map((agent) => [agent.id, agent]),
+);

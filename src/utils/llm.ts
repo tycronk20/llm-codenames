@@ -4,9 +4,18 @@ import { createUserPrompt } from '../prompts/userPrompt';
 import { GameState, OperativeMove, Role, SpymasterMove } from './game';
 import { modelCatalogById } from './modelCatalog';
 
-type Message = {
+export type OpenRouterReasoningDetail = Record<string, unknown>;
+
+export type Message = {
   role: 'system' | 'user' | 'assistant';
   content: string;
+  reasoningDetails?: OpenRouterReasoningDetail[];
+};
+
+export type AssistantPrefill = {
+  content: string;
+  reasoningDetails?: OpenRouterReasoningDetail[];
+  reasoning?: string;
 };
 
 type LLMRequest = {
@@ -28,6 +37,10 @@ export type StreamedLLMResponse =
       tokenCount: number;
     }
   | {
+      type: 'prefill';
+      prefill: AssistantPrefill;
+    }
+  | {
       type: 'reasoning';
       reasoning: string;
     }
@@ -38,7 +51,7 @@ export type StreamedLLMResponse =
 
 export function createMessagesFromGameState(
   gameState: GameState,
-  assistantPrefill?: string,
+  assistantPrefill?: AssistantPrefill,
 ): Message[] {
   const messages: Message[] = [
     {
@@ -51,10 +64,18 @@ export function createMessagesFromGameState(
     },
   ];
 
-  if (assistantPrefill?.trim()) {
+  if (
+    assistantPrefill &&
+    (assistantPrefill.content.trim() || assistantPrefill.reasoningDetails?.length)
+  ) {
     messages.push({
       role: 'assistant',
-      content: assistantPrefill,
+      content: assistantPrefill.content,
+      ...(assistantPrefill.reasoningDetails?.length ?
+        {
+          reasoningDetails: assistantPrefill.reasoningDetails,
+        }
+      : {}),
     });
   }
 
@@ -153,6 +174,25 @@ export async function* streamLLMResponse(
           yield {
             type: 'progress',
             tokenCount: event.tokenCount,
+          };
+        } else if (
+          event.type === 'prefill' &&
+          event.prefill &&
+          typeof event.prefill === 'object' &&
+          typeof (event.prefill as Record<string, unknown>).content === 'string'
+        ) {
+          const prefill = event.prefill as Record<string, unknown>;
+          yield {
+            type: 'prefill',
+            prefill: {
+              content: prefill.content as string,
+              reasoning:
+                typeof prefill.reasoning === 'string' ? prefill.reasoning : undefined,
+              reasoningDetails:
+                Array.isArray(prefill.reasoningDetails) ?
+                  (prefill.reasoningDetails as OpenRouterReasoningDetail[])
+                : undefined,
+            },
           };
         } else if (event.type === 'reasoning' && typeof event.reasoning === 'string') {
           emittedReasoning = true;
