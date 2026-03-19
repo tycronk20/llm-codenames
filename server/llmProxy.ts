@@ -10,6 +10,7 @@ type Message = {
   role: 'system' | 'user' | 'assistant';
   content: string;
   reasoningDetails?: OpenRouterReasoningDetail[];
+  reasoning?: string;
 };
 
 type MoveRole = 'spymaster' | 'operative';
@@ -245,15 +246,15 @@ export function createLlmApiMiddleware(env: Record<string, string>) {
         const fs = await import('node:fs/promises');
         const catalogPath = new URL('../src/utils/modelCatalog.ts', import.meta.url);
         const content = await fs.readFile(catalogPath, 'utf8');
-        
+
         const formattedIds = body.activeModelIds.map((id: string) => `  '${id}',`).join('\n');
         const newContent = content.replace(
           /export const activeModelIds: readonly ModelId\[\] = \[[^\]]*\];/,
           `export const activeModelIds: readonly ModelId[] = [\n${formattedIds}\n];`
         );
-        
+
         await fs.writeFile(catalogPath, newContent, 'utf8');
-        
+
         res.statusCode = 200;
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify({ success: true }));
@@ -390,9 +391,9 @@ async function fetchStructuredMove(
   try {
     const rawResult =
       model.provider === 'openai' ? await callOpenAiModel(request, env)
-      : model.provider === 'anthropic' ? await callAnthropicModel(request, env)
-      : model.provider === 'google' ? await callGoogleModel(request, env)
-      : await callOpenRouterModel(request, env, requestId);
+        : model.provider === 'anthropic' ? await callAnthropicModel(request, env)
+          : model.provider === 'google' ? await callGoogleModel(request, env)
+            : await callOpenRouterModel(request, env, requestId);
 
     if (requestId) {
       await writeRunLog({
@@ -542,7 +543,7 @@ async function callAnthropicModel(request: LlmApiRequest, env: Record<string, st
 
   const data = await readApiResponse(response, 'Anthropic');
   const toolUse = Array.isArray(data.content) ?
-      data.content.find((item: { type?: string }) => item.type === 'tool_use')
+    data.content.find((item: { type?: string }) => item.type === 'tool_use')
     : undefined;
 
   if (toolUse?.input) {
@@ -550,7 +551,7 @@ async function callAnthropicModel(request: LlmApiRequest, env: Record<string, st
   }
 
   const textBlock = Array.isArray(data.content) ?
-      data.content.find((item: { type?: string }) => item.type === 'text')
+    data.content.find((item: { type?: string }) => item.type === 'text')
     : undefined;
 
   return parseJsonContent(textBlock?.text);
@@ -611,8 +612,10 @@ async function streamOpenAiModel(
     timeout: timeoutMs,
   });
   openNdjsonStream(res);
-  let reasoningText = '';
-  let streamedText = '';
+  const lastMessage = request.messages[request.messages.length - 1];
+  const isPrefill = lastMessage?.role === 'assistant';
+  let reasoningText = isPrefill ? lastMessage.reasoning || '' : '';
+  let streamedText = isPrefill ? `${lastMessage.reasoning || ''}${lastMessage.content || ''}` : '';
   let sseEventCount = 0;
   try {
     for await (const event of stream) {
@@ -720,9 +723,11 @@ async function streamAnthropicModel(
   }
 
   openNdjsonStream(res);
-  let reasoningText = '';
-  let assistantText = '';
-  let streamedText = '';
+  const lastMessage = request.messages[request.messages.length - 1];
+  const isPrefill = lastMessage?.role === 'assistant';
+  let reasoningText = isPrefill ? lastMessage.reasoning || '' : '';
+  let assistantText = isPrefill ? lastMessage.content || '' : '';
+  let streamedText = isPrefill ? `${lastMessage.reasoning || ''}${lastMessage.content || ''}` : '';
   let streamedToolInput: Record<string, unknown> | null = null;
   let sseEventCount = 0;
   let stopReason = '';
@@ -762,10 +767,10 @@ async function streamAnthropicModel(
       if (event.type === 'content_block_start' && blockIndex !== undefined) {
         const initialInput =
           event.content_block?.input &&
-          typeof event.content_block.input === 'object' &&
-          Object.keys(event.content_block.input as Record<string, unknown>).length > 0 ?
+            typeof event.content_block.input === 'object' &&
+            Object.keys(event.content_block.input as Record<string, unknown>).length > 0 ?
             JSON.stringify(event.content_block.input)
-          : '';
+            : '';
         contentBlocks.set(blockIndex, {
           type: event.content_block?.type,
           text: typeof event.content_block?.text === 'string' ? event.content_block.text : '',
@@ -1027,9 +1032,11 @@ async function streamGoogleModel(
     createGoogleGenerateContentParams(request, { includeThoughts: true }),
   );
   openNdjsonStream(res);
-  let reasoningText = '';
-  let outputText = '';
-  let streamedText = '';
+  const lastMessage = request.messages[request.messages.length - 1];
+  const isPrefill = lastMessage?.role === 'assistant';
+  let reasoningText = isPrefill ? lastMessage.reasoning || '' : '';
+  let outputText = isPrefill ? lastMessage.content || '' : '';
+  let streamedText = isPrefill ? `${lastMessage.reasoning || ''}${lastMessage.content || ''}` : '';
   let sseEventCount = 0;
 
   try {
@@ -1135,10 +1142,12 @@ async function streamOpenRouterModel(
   }
 
   const inactivityTimeout = createInactivityTimeoutController(request.modelId, timeoutMs);
-  let reasoningText = '';
-  let outputText = '';
-  const reasoningDetails: OpenRouterReasoningDetail[] = [];
-  let streamedText = '';
+  const lastMessage = request.messages[request.messages.length - 1];
+  const isPrefill = lastMessage?.role === 'assistant';
+  let reasoningText = isPrefill ? lastMessage.reasoning || '' : '';
+  let outputText = isPrefill ? lastMessage.content || '' : '';
+  const reasoningDetails: OpenRouterReasoningDetail[] = isPrefill && lastMessage.reasoningDetails ? lastMessage.reasoningDetails : [];
+  let streamedText = isPrefill ? `${lastMessage.reasoning || ''}${lastMessage.content || ''}` : '';
   let sseEventCount = 0;
   try {
     inactivityTimeout.reset();
@@ -1251,7 +1260,7 @@ async function streamOpenRouterModel(
           output: outputText,
           reasoning: reasoningText.trim(),
         })
-      : await recoverOpenRouterMoveFromNonStream(request, env, requestId, 'empty_stream_output');
+        : await recoverOpenRouterMoveFromNonStream(request, env, requestId, 'empty_stream_output');
 
     if (requestId) {
       await writeRunLog({
@@ -1422,7 +1431,7 @@ function createAnthropicRequestBody(
         {
           type: 'auto' as const,
         }
-      : {
+        : {
           type: 'tool' as const,
           name: 'submit_move',
         },
@@ -1433,7 +1442,7 @@ function createAnthropicRequestBody(
           effort: thinkingConfig.effort,
         },
       }
-    : {}),
+      : {}),
     ...(options?.stream ? { stream: true } : {}),
   };
 }
@@ -1508,7 +1517,7 @@ function createOpenAiResponseBody(request: LlmApiRequest) {
           summary: 'auto' as const,
         },
       }
-    : {}),
+      : {}),
     text: {
       format: {
         type: 'json_schema' as const,
@@ -1542,7 +1551,7 @@ function createGoogleGenerateContentParams(
             parts: [{ text: system }],
           },
         }
-      : {}),
+        : {}),
       responseMimeType: 'application/json',
       responseJsonSchema: moveSchemas[request.role],
       ...(options?.includeThoughts ?
@@ -1551,7 +1560,7 @@ function createGoogleGenerateContentParams(
             includeThoughts: true,
           },
         }
-      : {}),
+        : {}),
     },
   };
 }
@@ -1601,9 +1610,9 @@ function createOpenRouterChatParams(
               {
                 reasoningDetails: message.reasoningDetails,
               }
-            : {}),
+              : {}),
           }
-        : {
+          : {
             role: message.role,
             content: message.content,
           },
@@ -1875,9 +1884,9 @@ function serializeRepairSource(output: unknown) {
     const text = output
       .map((part) =>
         typeof part === 'string' ? part
-        : part && typeof part === 'object' && 'text' in part && typeof part.text === 'string' ?
-          part.text
-        : JSON.stringify(part)
+          : part && typeof part === 'object' && 'text' in part && typeof part.text === 'string' ?
+            part.text
+            : JSON.stringify(part)
       )
       .filter(Boolean)
       .join('\n');
@@ -1954,9 +1963,9 @@ function parseJsonContent(content: unknown) {
     const text = content
       .map((part) =>
         typeof part === 'string' ? part
-        : part && typeof part === 'object' && 'text' in part && typeof part.text === 'string' ?
-          part.text
-        : '',
+          : part && typeof part === 'object' && 'text' in part && typeof part.text === 'string' ?
+            part.text
+            : '',
       )
       .join('\n');
 
@@ -1974,7 +1983,7 @@ function parseJsonContent(content: unknown) {
   const candidate =
     content.includes('{') && content.includes('}') ?
       content.slice(content.indexOf('{'), content.lastIndexOf('}') + 1)
-    : content;
+      : content;
 
   return JSON.parse(jsonrepair(candidate));
 }
@@ -2094,7 +2103,7 @@ function extractOpenRouterReasoningDetailsText(reasoningDetails: unknown, joiner
           .map((part: unknown) =>
             part && typeof part === 'object' && 'text' in part && typeof part.text === 'string' ?
               part.text
-            : '',
+              : '',
           )
           .filter(Boolean)
           .join(joiner);
@@ -2120,9 +2129,9 @@ function extractOpenRouterContentText(payload: Record<string, unknown>) {
   return content
     .map((part) =>
       typeof part === 'string' ? part
-      : part && typeof part === 'object' && 'text' in part && typeof part.text === 'string' ?
+        : part && typeof part === 'object' && 'text' in part && typeof part.text === 'string' ?
           part.text
-        : '',
+          : '',
     )
     .join('');
 }
@@ -2263,7 +2272,7 @@ function parseMessage(message: unknown): Message {
           .filter((detail): detail is OpenRouterReasoningDetail => !!detail && typeof detail === 'object')
           .map((detail) => ({ ...detail })),
       }
-    : {}),
+      : {}),
   };
 }
 
@@ -2291,13 +2300,13 @@ function buildApiError(
 ) {
   const message =
     typeof data?.error === 'object' &&
-    data.error &&
-    'message' in data.error &&
-    typeof data.error.message === 'string' ?
+      data.error &&
+      'message' in data.error &&
+      typeof data.error.message === 'string' ?
       data.error.message
-    : typeof data?.error === 'string' ? data.error
-    : typeof data?.message === 'string' ? data.message
-    : text;
+      : typeof data?.error === 'string' ? data.error
+        : typeof data?.message === 'string' ? data.message
+          : text;
 
   return new Error(`${providerName} API error (${status}): ${message}`);
 }
@@ -2423,7 +2432,7 @@ function getClientErrorMessage(error: unknown, modelId?: string, timeoutMs?: num
     const modelLabel = modelId ? `Model ${modelId}` : 'The model';
     const seconds = timeoutMs ? Math.round(timeoutMs / 1000) : undefined;
     return seconds ?
-        `${modelLabel} timed out after ${seconds}s.`
+      `${modelLabel} timed out after ${seconds}s.`
       : `${modelLabel} timed out.`;
   }
 
@@ -2497,7 +2506,7 @@ function extractGameSnapshot(messages: Message[]) {
         revealedCount: board.filter((card) => card.isRevealed).length,
         recentlyRevealedCount: board.filter((card) => card.wasRecentlyRevealed).length,
       }
-    : {}),
+      : {}),
   };
 }
 
@@ -2527,7 +2536,7 @@ function parseBoardSnapshot(userMessage: string) {
         ...(typeof card.isRevealed === 'boolean' ? { isRevealed: card.isRevealed } : {}),
         ...(typeof card.wasRecentlyRevealed === 'boolean' ?
           { wasRecentlyRevealed: card.wasRecentlyRevealed }
-        : {}),
+          : {}),
       }))
       .filter((card) => card.word);
   } catch {

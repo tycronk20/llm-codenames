@@ -10,6 +10,7 @@ export type Message = {
   role: 'system' | 'user' | 'assistant';
   content: string;
   reasoningDetails?: OpenRouterReasoningDetail[];
+  reasoning?: string;
 };
 
 export type AssistantPrefill = {
@@ -66,7 +67,9 @@ export function createMessagesFromGameState(
 
   if (
     assistantPrefill &&
-    (assistantPrefill.content.trim() || assistantPrefill.reasoningDetails?.length)
+    (assistantPrefill.content.trim() ||
+      assistantPrefill.reasoningDetails?.length ||
+      assistantPrefill.reasoning?.trim())
   ) {
     messages.push({
       role: 'assistant',
@@ -74,6 +77,11 @@ export function createMessagesFromGameState(
       ...(assistantPrefill.reasoningDetails?.length ?
         {
           reasoningDetails: assistantPrefill.reasoningDetails,
+        }
+      : {}),
+      ...(assistantPrefill.reasoning?.trim() ?
+        {
+          reasoning: assistantPrefill.reasoning,
         }
       : {}),
     });

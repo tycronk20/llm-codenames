@@ -177,8 +177,8 @@ export default function App() {
     setGameState(savedGame.gameState);
     setAppState(
       savedGame.gameState.gameWinner ? 'game_over'
-      : savedGame.appState === 'error' ? 'error'
-      : savedGame.appState,
+        : savedGame.appState === 'error' ? 'error'
+          : savedGame.appState,
     );
     setIsGamePaused(forcePaused ? true : savedGame.isGamePaused);
     setErrorMessage(savedGame.errorMessage);
@@ -275,11 +275,11 @@ export default function App() {
       const assistantPrefill =
         savedPrefill && activeModel.openRouterAssistantPrefillEnabled !== false ?
           savedPrefill
-        : undefined;
+          : undefined;
       const resumeMode =
         assistantPrefill ? 'prefill'
-        : savedPrefill ? 'prefill-disabled'
-        : 'fresh';
+          : savedPrefill ? 'prefill-disabled'
+            : 'fresh';
       activeTurnKeyRef.current = requestKey;
       activeRequestControllerRef.current = controller;
       setAppState('waiting_for_response');
@@ -333,7 +333,7 @@ export default function App() {
                 const prefillSignature =
                   savedPrefillForTurn ?
                     `${turnKey}:${savedPrefillForTurn.content.length}:${savedPrefillForTurn.reasoning?.length ?? 0}:${savedPrefillForTurn.reasoningDetails?.length ?? 0}`
-                  : null;
+                    : null;
 
                 if (
                   activeModel.autoResumeOnIdle !== false &&
@@ -438,7 +438,7 @@ export default function App() {
           setErrorMessage(
             error instanceof Error ?
               error.message
-            : 'An unknown error occurred while calling the LLM.',
+              : 'An unknown error occurred while calling the LLM.',
           );
           setAppState('error');
           setIsGamePaused(true);
@@ -486,34 +486,29 @@ export default function App() {
   }, [pendingRequest]);
 
   return (
-    <div className='flex min-h-screen flex-col bg-gradient-to-br from-slate-800 to-slate-600 antialiased lg:flex-row'>
+    <div className='flex min-h-screen w-full flex-col bg-gradient-to-br from-slate-800 to-slate-600 antialiased lg:h-screen lg:flex-row lg:overflow-hidden'>
       <aside
-        className={`border-b border-slate-500/30 bg-slate-950/40 backdrop-blur-sm transition-all duration-200 lg:h-screen lg:flex-none lg:border-b-0 lg:border-r ${
-          isBrowserCollapsed ? 'w-full lg:w-[4.5rem]' : 'w-full lg:w-64'
-        }`}
+        className={`flex flex-col border-b border-slate-500/30 bg-slate-950/40 backdrop-blur-sm transition-all duration-200 lg:h-screen lg:flex-none lg:border-b-0 lg:border-r ${isBrowserCollapsed ? 'w-full lg:w-[4.5rem]' : 'w-full lg:w-64'
+          }`}
       >
         <div
-          className={`border-slate-500/30 ${
-            isBrowserCollapsed ? 'border-b px-3 py-3 lg:h-full lg:border-b-0' : 'border-b px-3 py-3'
-          }`}
+          className={`shrink-0 border-slate-500/30 ${isBrowserCollapsed ? 'border-b px-3 py-3 lg:h-full lg:border-b-0' : 'border-b px-3 py-3'
+            }`}
         >
           <div
-            className={`flex gap-2 ${
-              isBrowserCollapsed ? 'items-center justify-between lg:flex-col lg:items-stretch' : 'items-center justify-between'
-            }`}
+            className={`flex gap-2 ${isBrowserCollapsed ? 'items-center justify-between lg:flex-col lg:items-stretch' : 'items-center justify-between'
+              }`}
           >
             <div
-              className={`flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.18em] text-slate-200 ${
-                isBrowserCollapsed ? 'lg:justify-center' : ''
-              }`}
+              className={`flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.18em] text-slate-200 ${isBrowserCollapsed ? 'lg:justify-center' : ''
+                }`}
             >
               <FolderKanban className='size-4' />
               {!isBrowserCollapsed && 'Games'}
             </div>
             <div
-              className={`flex items-center gap-2 ${
-                isBrowserCollapsed ? 'lg:flex-col' : ''
-              }`}
+              className={`flex items-center gap-2 flex-wrap justify-end ${isBrowserCollapsed ? 'lg:flex-col lg:justify-start' : ''
+                }`}
             >
               <button
                 type='button'
@@ -524,7 +519,7 @@ export default function App() {
               >
                 {isBrowserCollapsed ?
                   <ChevronRight className='size-4' />
-                : <ChevronLeft className='size-4' />}
+                  : <ChevronLeft className='size-4' />}
               </button>
               <button
                 type='button'
@@ -535,36 +530,26 @@ export default function App() {
               >
                 <Settings className='size-4' />
               </button>
-              <button
-                type='button'
-                onClick={startNewGame}
-                className={`inline-flex items-center justify-center gap-2 rounded-full border border-emerald-400/30 bg-emerald-500/10 text-[11px] font-semibold uppercase tracking-[0.16em] text-emerald-100 transition hover:bg-emerald-500/20 ${
-                  isBrowserCollapsed ? 'p-2 lg:w-full' : 'px-3 py-1.5'
-                }`}
-                title='New Game'
-                aria-label='New Game'
-              >
-                <Plus className='size-3' />
-                {!isBrowserCollapsed && 'New Game'}
-              </button>
+              <div className={`w-full flex ${isBrowserCollapsed ? 'justify-center' : 'justify-end lg:w-auto mt-2 lg:mt-0'}`}>
+                <button
+                  type='button'
+                  onClick={startNewGame}
+                  className={`inline-flex items-center justify-center gap-2 rounded-full border border-emerald-400/30 bg-emerald-500/10 text-[11px] font-semibold uppercase tracking-[0.16em] text-emerald-100 transition hover:bg-emerald-500/20 ${isBrowserCollapsed ? 'p-2 w-full' : 'px-3 py-1.5 whitespace-nowrap'
+                    }`}
+                  title='New Game'
+                  aria-label='New Game'
+                >
+                  <Plus className='size-3 shrink-0' />
+                  {!isBrowserCollapsed && <span>New Game</span>}
+                </button>
+              </div>
             </div>
           </div>
 
-          {isBrowserCollapsed ?
-            <div className='mt-3 flex items-center justify-between rounded-2xl border border-slate-500/30 bg-slate-900/60 px-3 py-2 text-[11px] uppercase tracking-[0.18em] text-slate-400 lg:flex-col lg:gap-3 lg:px-0 lg:py-4'>
-              <span>{browserGames.length} games</span>
-              <div className='rounded-full border border-sky-400/30 bg-sky-500/10 px-2 py-1 text-[10px] font-semibold text-sky-100'>
-                {browserGames.findIndex((savedGame) => savedGame.id === activeGameId) + 1}
-              </div>
-            </div>
-          : <div className='mt-3 rounded-2xl border border-slate-500/30 bg-slate-900/60 px-3 py-2 text-[11px] uppercase tracking-[0.18em] text-slate-400'>
-              {browserGames.length} saved games
-            </div>
-          }
         </div>
 
         {!isBrowserCollapsed && (
-          <div className='max-h-[18rem] overflow-y-auto px-3 py-3 lg:max-h-[calc(100vh-7rem)]'>
+          <div className='flex-1 min-h-0 overflow-y-auto px-3 py-3 max-h-[18rem] lg:max-h-none'>
             <div className='space-y-2'>
               {browserGames.map((savedGame) => {
                 const revealedRed = 9 - savedGame.gameState.remainingRed;
@@ -575,11 +560,10 @@ export default function App() {
                     key={savedGame.id}
                     type='button'
                     onClick={() => openSavedGame(savedGame)}
-                    className={`flex w-full flex-col gap-1.5 rounded-xl border px-3 py-2.5 text-left transition ${
-                      savedGame.id === activeGameId ?
-                        'border-sky-300/60 bg-sky-500/15 shadow-lg shadow-sky-950/20'
+                    className={`flex w-full flex-col gap-1.5 rounded-xl border px-3 py-2.5 text-left transition ${savedGame.id === activeGameId ?
+                      'border-sky-300/60 bg-sky-500/15 shadow-lg shadow-sky-950/20'
                       : 'border-slate-500/30 bg-slate-900/60 hover:border-slate-400/50 hover:bg-slate-900/80'
-                    }`}
+                      }`}
                   >
                     <div className='flex items-start justify-between gap-2'>
                       <div className='min-w-0'>
@@ -589,15 +573,14 @@ export default function App() {
                         </div>
                       </div>
                       <span
-                        className={`shrink-0 rounded-full px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.16em] ${
-                          savedGame.gameState.gameWinner ?
-                            'bg-emerald-500/15 text-emerald-200'
+                        className={`shrink-0 rounded-full px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.16em] ${savedGame.gameState.gameWinner ?
+                          'bg-emerald-500/15 text-emerald-200'
                           : savedGame.appState === 'error' ?
                             'bg-rose-500/15 text-rose-200'
-                          : savedGame.isGamePaused ?
-                            'bg-amber-500/15 text-amber-100'
-                          : 'bg-sky-500/15 text-sky-100'
-                        }`}
+                            : savedGame.isGamePaused ?
+                              'bg-amber-500/15 text-amber-100'
+                              : 'bg-sky-500/15 text-sky-100'
+                          }`}
                       >
                         {describeSavedGameState(savedGame)}
                       </span>
@@ -621,7 +604,7 @@ export default function App() {
       </aside>
 
       {/* Left panel: Scoreboard + Game Board + Game Controls */}
-      <div className='flex w-full flex-col items-center gap-y-6 px-2 sm:mt-4 lg:min-w-0 lg:flex-1 lg:gap-y-8 lg:px-4'>
+      <div className='flex w-full flex-col items-center gap-y-6 px-2 sm:mt-4 lg:min-w-0 lg:flex-1 lg:overflow-y-auto lg:gap-y-8 lg:px-4'>
         {appState === 'error' && (
           <div className='fixed left-4 top-4 z-50 rounded-md bg-red-500 px-4 py-2 text-white shadow-lg'>
             {errorMessage ?? 'An error occurred. Please reload the game.'}
@@ -681,17 +664,17 @@ export default function App() {
             <>
               <Play className='inline size-4' /> Start
             </>
-          : appState === 'game_over' || appState === 'error' ?
-            <>
-              <RotateCcw className='inline size-4' /> Restart
-            </>
-          : isGamePaused ?
-            <>
-              <Play className='inline size-4' /> Continue
-            </>
-          : <>
-              <Pause className='inline size-4' /> Pause
-            </>
+            : appState === 'game_over' || appState === 'error' ?
+              <>
+                <RotateCcw className='inline size-4' /> Restart
+              </>
+              : isGamePaused ?
+                <>
+                  <Play className='inline size-4' /> Continue
+                </>
+                : <>
+                  <Pause className='inline size-4' /> Pause
+                </>
           }
         </button>
       </div>
@@ -701,6 +684,105 @@ export default function App() {
         ref={chatContainerRef}
         className='relative w-full bg-slate-800/50 p-2 backdrop-blur-sm md:max-h-[32rem] md:overflow-y-auto lg:h-screen lg:w-[22rem] lg:border-l lg:border-slate-500/30'
       >
+        {/* Spinner & Pause indicator */}
+        {appState === 'waiting_for_response' && (
+          <div className='sticky top-0 z-10 mb-2 -mx-2 -mt-2 flex w-full flex-col border-b border-slate-500/40 bg-slate-900/95 px-4 py-3 text-xs font-semibold tracking-wide text-slate-100 shadow-sm backdrop-blur-md'>
+            <div className='flex items-start justify-between'>
+              <div className='flex flex-col'>
+                <div className='flex items-center gap-2'>
+                  <Loader2 className='size-4 animate-spin text-slate-200' />
+                  <span>{pendingRequest?.modelName ?? 'LLM'} thinking</span>
+                </div>
+                <span className='ml-6 mt-1 text-[10px] font-medium uppercase tracking-[0.16em] text-slate-400'>
+                  {pendingRequest?.team} {pendingRequest?.role} · {requestAgeSeconds}s
+                </span>
+                <span className='ml-6 text-[10px] uppercase tracking-[0.16em] text-slate-500'>
+                  {streamedTokenCount > 0 ? `~${streamedTokenCount} toks returned`
+                    : hiddenThinkingUpdateCount > 0 ?
+                      `hidden CoT active · ${hiddenThinkingUpdateCount} updates`
+                      : 'waiting for first token'}
+                </span>
+              </div>
+              <div className='flex flex-col items-end gap-2'>
+                <span className='text-[10px] uppercase tracking-[0.16em] text-slate-500'>
+                  {pendingRequest?.resumeMode === 'prefill' ? 'resume: prefill state'
+                    : pendingRequest?.resumeMode === 'prefill-disabled' ? 'resume: local state only'
+                      : 'resume: clean slate'}
+                </span>
+                <div className='flex gap-2'>
+                  <button
+                    type='button'
+                    onClick={() => {
+                      cancelActiveRequest();
+                      setIdleWarningMessage(null);
+                      setPendingRequest(null);
+                      setStreamedTokenCount(0);
+                      setIsGamePaused(true);
+                      setAppState('ready_for_turn');
+                    }}
+                    className='flex items-center gap-1 rounded bg-amber-500/20 px-2 py-1 text-[11px] font-bold uppercase tracking-[0.16em] text-amber-200 transition hover:bg-amber-500/30'
+                  >
+                    <Square className='size-3 fill-current' />
+                    Pause
+                  </button>
+                  <button
+                    type='button'
+                    onClick={retryCurrentTurn}
+                    className='flex items-center gap-1 rounded border border-rose-400/40 bg-rose-500/10 px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-rose-100 transition hover:bg-rose-500/20'
+                  >
+                    <RotateCcw className='size-3' />
+                    Retry
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {isGamePaused && appState === 'ready_for_turn' && (
+          <div className='sticky top-0 z-10 mb-2 -mx-2 -mt-2 flex w-full flex-col border-b border-amber-500/40 bg-slate-900/95 px-4 py-3 text-xs font-semibold tracking-wide text-slate-100 shadow-sm backdrop-blur-md'>
+            <div className='flex items-center justify-between'>
+              <div className='flex flex-col'>
+                <div className='flex items-center gap-2 text-amber-500'>
+                  <Pause className='size-4 fill-current' />
+                  <span>{currentTurnPrefill ? 'Paused with saved state' : 'Paused'}</span>
+                </div>
+                {currentTurnPrefill && (
+                  <span className='ml-6 mt-1 text-[10px] uppercase tracking-[0.16em] text-slate-500'>
+                    {gameState.agents[currentTurnPrefill.team][currentTurnPrefill.role]
+                      .openRouterAssistantPrefillEnabled === false ?
+                      'local state only'
+                      : 'saved prefill active'}
+                  </span>
+                )}
+              </div>
+              <div className='flex items-center gap-2'>
+                <button
+                  type='button'
+                  onClick={() => {
+                    setRequestEpoch((value) => value + 1);
+                    setAppState('ready_for_turn');
+                    setIsGamePaused(false);
+                  }}
+                  className='flex items-center gap-1 rounded bg-amber-500/20 px-3 py-1.5 text-[11px] font-bold uppercase tracking-[0.16em] text-amber-200 transition hover:bg-amber-500/30'
+                >
+                  <Play className='size-3 fill-current' />
+                  Resume
+                </button>
+                {currentTurnPrefill && (
+                  <button
+                    type='button'
+                    onClick={retryCurrentTurn}
+                    className='flex items-center gap-1 rounded border border-rose-400/40 bg-rose-500/10 px-2 py-1.5 text-[11px] font-semibold uppercase tracking-[0.16em] text-rose-100 transition hover:bg-rose-500/20'
+                  >
+                    <RotateCcw className='size-3' />
+                    Retry Fresh
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
         {gameState.chatHistory.map((message, index) => (
           <Chat key={index} {...message} />
         ))}
@@ -722,82 +804,7 @@ export default function App() {
             </div>
           </div>
         )}
-        {/* Spinner & Pause indicator */}
-        {appState === 'waiting_for_response' && (
-          <div className='sticky flex w-full justify-end p-2'>
-            <div className='flex items-center gap-3 rounded-full border border-slate-500/40 bg-slate-900/90 px-4 py-2 text-xs font-semibold tracking-wide text-slate-100 shadow-lg'>
-              <div className='flex flex-col text-right'>
-                <span>{pendingRequest?.modelName ?? 'LLM'} thinking</span>
-                <span className='text-[11px] font-medium uppercase tracking-[0.16em] text-slate-400'>
-                  {pendingRequest?.team} {pendingRequest?.role} · {requestAgeSeconds}s
-                </span>
-                <span className='text-[11px] font-medium uppercase tracking-[0.16em] text-slate-500'>
-                  {streamedTokenCount > 0 ? `~${streamedTokenCount} tok streamed`
-                  : hiddenThinkingUpdateCount > 0 ?
-                    `hidden reasoning active · ${hiddenThinkingUpdateCount} update${hiddenThinkingUpdateCount === 1 ? '' : 's'}`
-                  : 'awaiting first visible token'}
-                </span>
-                <span className='text-[11px] font-medium uppercase tracking-[0.16em] text-slate-500'>
-                  {pendingRequest?.resumeMode === 'prefill' ? 'resume: saved prefill'
-                  : pendingRequest?.resumeMode === 'prefill-disabled' ? 'resume: saved locally only'
-                  : 'resume: clean slate'}
-                </span>
-              </div>
-              <Loader2 className='size-4 animate-spin text-slate-200' />
-              <button
-                type='button'
-                onClick={() => {
-                  cancelActiveRequest();
-                  setIdleWarningMessage(null);
-                  setPendingRequest(null);
-                  setStreamedTokenCount(0);
-                  setIsGamePaused(true);
-                  setAppState('ready_for_turn');
-                }}
-                className='flex items-center gap-1 rounded-full border border-amber-400/40 bg-amber-500/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-amber-100 transition hover:bg-amber-500/20'
-              >
-                <Square className='size-3 fill-current' />
-                Pause
-              </button>
-              <button
-                type='button'
-                onClick={retryCurrentTurn}
-                className='flex items-center gap-1 rounded-full border border-rose-400/40 bg-rose-500/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-rose-100 transition hover:bg-rose-500/20'
-              >
-                <RotateCcw className='size-3' />
-                Retry
-              </button>
-            </div>
-          </div>
-        )}
-        {isGamePaused && appState === 'ready_for_turn' && (
-          <div className='sticky flex w-full justify-end p-2'>
-            <div className='flex items-center gap-3 rounded-full border border-slate-500/40 bg-slate-900/90 px-4 py-2 text-xs font-semibold tracking-wide text-slate-100 shadow-lg'>
-              <div className='flex flex-col text-right'>
-                <span>{currentTurnPrefill ? 'Paused with saved prefill' : 'Paused'}</span>
-                {currentTurnPrefill && (
-                  <span className='text-[11px] font-medium uppercase tracking-[0.16em] text-slate-500'>
-                    {gameState.agents[currentTurnPrefill.team][currentTurnPrefill.role]
-                      .openRouterAssistantPrefillEnabled === false ?
-                      'resume: saved locally only'
-                    : 'resume: saved prefill'}
-                  </span>
-                )}
-              </div>
-              <Pause className='text-slate-200' />
-              {currentTurnPrefill && (
-                <button
-                  type='button'
-                  onClick={retryCurrentTurn}
-                  className='flex items-center gap-1 rounded-full border border-rose-400/40 bg-rose-500/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-rose-100 transition hover:bg-rose-500/20'
-                >
-                  <RotateCcw className='size-3' />
-                  Retry Fresh
-                </button>
-              )}
-            </div>
-          </div>
-        )}
+
       </div>
 
       <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} />
