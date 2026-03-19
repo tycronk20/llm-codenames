@@ -1,4 +1,15 @@
-import { FolderKanban, Loader2, Pause, Play, Plus, RotateCcw, Settings, Square } from 'lucide-react';
+import {
+  ChevronLeft,
+  ChevronRight,
+  FolderKanban,
+  Loader2,
+  Pause,
+  Play,
+  Plus,
+  RotateCcw,
+  Settings,
+  Square,
+} from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import Card from './components/Card';
 import { Chat } from './components/Chat';
@@ -98,6 +109,7 @@ export default function App() {
     () => initialActiveGame.appState,
   );
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isBrowserCollapsed, setIsBrowserCollapsed] = useState(false);
   const [isGamePaused, setIsGamePaused] = useState(
     () => initialActiveGame.isGamePaused,
   );
@@ -475,6 +487,139 @@ export default function App() {
 
   return (
     <div className='flex min-h-screen flex-col bg-gradient-to-br from-slate-800 to-slate-600 antialiased lg:flex-row'>
+      <aside
+        className={`border-b border-slate-500/30 bg-slate-950/40 backdrop-blur-sm transition-all duration-200 lg:h-screen lg:flex-none lg:border-b-0 lg:border-r ${
+          isBrowserCollapsed ? 'w-full lg:w-[4.5rem]' : 'w-full lg:w-64'
+        }`}
+      >
+        <div
+          className={`border-slate-500/30 ${
+            isBrowserCollapsed ? 'border-b px-3 py-3 lg:h-full lg:border-b-0' : 'border-b px-3 py-3'
+          }`}
+        >
+          <div
+            className={`flex gap-2 ${
+              isBrowserCollapsed ? 'items-center justify-between lg:flex-col lg:items-stretch' : 'items-center justify-between'
+            }`}
+          >
+            <div
+              className={`flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.18em] text-slate-200 ${
+                isBrowserCollapsed ? 'lg:justify-center' : ''
+              }`}
+            >
+              <FolderKanban className='size-4' />
+              {!isBrowserCollapsed && 'Games'}
+            </div>
+            <div
+              className={`flex items-center gap-2 ${
+                isBrowserCollapsed ? 'lg:flex-col' : ''
+              }`}
+            >
+              <button
+                type='button'
+                onClick={() => setIsBrowserCollapsed((current) => !current)}
+                className='inline-flex items-center justify-center rounded-full border border-slate-500/30 bg-slate-800/50 p-1.5 text-slate-400 transition hover:bg-slate-700 hover:text-slate-200'
+                title={isBrowserCollapsed ? 'Expand games browser' : 'Collapse games browser'}
+                aria-label={isBrowserCollapsed ? 'Expand games browser' : 'Collapse games browser'}
+              >
+                {isBrowserCollapsed ?
+                  <ChevronRight className='size-4' />
+                : <ChevronLeft className='size-4' />}
+              </button>
+              <button
+                type='button'
+                onClick={() => setIsSettingsOpen(true)}
+                className='inline-flex items-center justify-center rounded-full border border-slate-500/30 bg-slate-800/50 p-1.5 text-slate-400 transition hover:bg-slate-700 hover:text-slate-200'
+                title='Settings'
+                aria-label='Settings'
+              >
+                <Settings className='size-4' />
+              </button>
+              <button
+                type='button'
+                onClick={startNewGame}
+                className={`inline-flex items-center justify-center gap-2 rounded-full border border-emerald-400/30 bg-emerald-500/10 text-[11px] font-semibold uppercase tracking-[0.16em] text-emerald-100 transition hover:bg-emerald-500/20 ${
+                  isBrowserCollapsed ? 'p-2 lg:w-full' : 'px-3 py-1.5'
+                }`}
+                title='New Game'
+                aria-label='New Game'
+              >
+                <Plus className='size-3' />
+                {!isBrowserCollapsed && 'New Game'}
+              </button>
+            </div>
+          </div>
+
+          {isBrowserCollapsed ?
+            <div className='mt-3 flex items-center justify-between rounded-2xl border border-slate-500/30 bg-slate-900/60 px-3 py-2 text-[11px] uppercase tracking-[0.18em] text-slate-400 lg:flex-col lg:gap-3 lg:px-0 lg:py-4'>
+              <span>{browserGames.length} games</span>
+              <div className='rounded-full border border-sky-400/30 bg-sky-500/10 px-2 py-1 text-[10px] font-semibold text-sky-100'>
+                {browserGames.findIndex((savedGame) => savedGame.id === activeGameId) + 1}
+              </div>
+            </div>
+          : <div className='mt-3 rounded-2xl border border-slate-500/30 bg-slate-900/60 px-3 py-2 text-[11px] uppercase tracking-[0.18em] text-slate-400'>
+              {browserGames.length} saved games
+            </div>
+          }
+        </div>
+
+        {!isBrowserCollapsed && (
+          <div className='max-h-[18rem] overflow-y-auto px-3 py-3 lg:max-h-[calc(100vh-7rem)]'>
+            <div className='space-y-2'>
+              {browserGames.map((savedGame) => {
+                const revealedRed = 9 - savedGame.gameState.remainingRed;
+                const revealedBlue = 8 - savedGame.gameState.remainingBlue;
+
+                return (
+                  <button
+                    key={savedGame.id}
+                    type='button'
+                    onClick={() => openSavedGame(savedGame)}
+                    className={`flex w-full flex-col gap-1.5 rounded-xl border px-3 py-2.5 text-left transition ${
+                      savedGame.id === activeGameId ?
+                        'border-sky-300/60 bg-sky-500/15 shadow-lg shadow-sky-950/20'
+                      : 'border-slate-500/30 bg-slate-900/60 hover:border-slate-400/50 hover:bg-slate-900/80'
+                    }`}
+                  >
+                    <div className='flex items-start justify-between gap-2'>
+                      <div className='min-w-0'>
+                        <div className='truncate text-sm font-semibold text-slate-100'>{savedGame.title}</div>
+                        <div className='text-[10px] uppercase tracking-[0.16em] text-slate-400'>
+                          {formatSavedGameTimestamp(savedGame.updatedAt)}
+                        </div>
+                      </div>
+                      <span
+                        className={`shrink-0 rounded-full px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.16em] ${
+                          savedGame.gameState.gameWinner ?
+                            'bg-emerald-500/15 text-emerald-200'
+                          : savedGame.appState === 'error' ?
+                            'bg-rose-500/15 text-rose-200'
+                          : savedGame.isGamePaused ?
+                            'bg-amber-500/15 text-amber-100'
+                          : 'bg-sky-500/15 text-sky-100'
+                        }`}
+                      >
+                        {describeSavedGameState(savedGame)}
+                      </span>
+                    </div>
+                    <div className='truncate text-[11px] text-slate-300'>
+                      {savedGame.gameState.currentTeam} {savedGame.gameState.currentRole}
+                      {savedGame.gameState.currentClue &&
+                        ` · ${savedGame.gameState.currentClue.clueText}, ${savedGame.gameState.currentClue.number}`}
+                    </div>
+                    <div className='flex items-center gap-2 text-[10px] uppercase tracking-[0.16em] text-slate-500'>
+                      <span>Chat {savedGame.gameState.chatHistory.length}</span>
+                      <span>R {revealedRed}</span>
+                      <span>B {revealedBlue}</span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </aside>
+
       {/* Left panel: Scoreboard + Game Board + Game Controls */}
       <div className='flex w-full flex-col items-center gap-y-6 px-2 sm:mt-4 lg:min-w-0 lg:flex-1 lg:gap-y-8 lg:px-4'>
         {appState === 'error' && (
@@ -551,90 +696,10 @@ export default function App() {
         </button>
       </div>
 
-      <aside className='w-full border-t border-slate-500/30 bg-slate-950/35 backdrop-blur-sm lg:w-80 lg:border-l lg:border-t-0'>
-        <div className='flex items-center justify-between border-b border-slate-500/30 px-4 py-4'>
-          <div className='flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.18em] text-slate-200'>
-            <FolderKanban className='size-4' />
-            Games
-          </div>
-          <div className='flex items-center gap-2'>
-            <button
-              type='button'
-              onClick={() => setIsSettingsOpen(true)}
-              className='inline-flex items-center justify-center rounded-full border border-slate-500/30 bg-slate-800/50 p-1.5 text-slate-400 transition hover:bg-slate-700 hover:text-slate-200'
-              title='Settings'
-            >
-              <Settings className='size-4' />
-            </button>
-            <button
-              type='button'
-              onClick={startNewGame}
-              className='inline-flex items-center gap-2 rounded-full border border-emerald-400/30 bg-emerald-500/10 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.16em] text-emerald-100 transition hover:bg-emerald-500/20'
-            >
-              <Plus className='size-3' />
-              New Game
-            </button>
-          </div>
-        </div>
-        <div className='max-h-[18rem] overflow-y-auto p-3 lg:max-h-[calc(100vh-4.5rem)]'>
-          <div className='space-y-2'>
-            {browserGames.map((savedGame) => {
-              const revealedRed = 9 - savedGame.gameState.remainingRed;
-              const revealedBlue = 8 - savedGame.gameState.remainingBlue;
-
-              return (
-                <button
-                  key={savedGame.id}
-                  type='button'
-                  onClick={() => openSavedGame(savedGame)}
-                  className={`flex w-full flex-col gap-2 rounded-2xl border px-4 py-3 text-left transition ${
-                    savedGame.id === activeGameId ?
-                      'border-sky-300/60 bg-sky-500/15 shadow-lg shadow-sky-950/20'
-                    : 'border-slate-500/30 bg-slate-900/60 hover:border-slate-400/50 hover:bg-slate-900/80'
-                  }`}
-                >
-                  <div className='flex items-start justify-between gap-3'>
-                    <div>
-                      <div className='text-sm font-semibold text-slate-100'>{savedGame.title}</div>
-                      <div className='text-[11px] uppercase tracking-[0.16em] text-slate-400'>
-                        {formatSavedGameTimestamp(savedGame.updatedAt)}
-                      </div>
-                    </div>
-                    <span
-                      className={`rounded-full px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] ${
-                        savedGame.gameState.gameWinner ?
-                          'bg-emerald-500/15 text-emerald-200'
-                        : savedGame.appState === 'error' ?
-                          'bg-rose-500/15 text-rose-200'
-                        : savedGame.isGamePaused ?
-                          'bg-amber-500/15 text-amber-100'
-                        : 'bg-sky-500/15 text-sky-100'
-                      }`}
-                    >
-                      {describeSavedGameState(savedGame)}
-                    </span>
-                  </div>
-                  <div className='text-xs text-slate-300'>
-                    {savedGame.gameState.currentTeam} {savedGame.gameState.currentRole}
-                    {savedGame.gameState.currentClue &&
-                      ` · ${savedGame.gameState.currentClue.clueText}, ${savedGame.gameState.currentClue.number}`}
-                  </div>
-                  <div className='flex items-center gap-3 text-[11px] uppercase tracking-[0.16em] text-slate-500'>
-                    <span>Chat {savedGame.gameState.chatHistory.length}</span>
-                    <span>Red {revealedRed}</span>
-                    <span>Blue {revealedBlue}</span>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      </aside>
-
       {/* Right panel: Chat history */}
       <div
         ref={chatContainerRef}
-        className='relative w-full bg-slate-800/50 p-2 backdrop-blur-sm md:max-h-[32rem] md:overflow-y-auto lg:h-screen lg:w-[24rem] lg:border-l lg:border-slate-500/30'
+        className='relative w-full bg-slate-800/50 p-2 backdrop-blur-sm md:max-h-[32rem] md:overflow-y-auto lg:h-screen lg:w-[22rem] lg:border-l lg:border-slate-500/30'
       >
         {gameState.chatHistory.map((message, index) => (
           <Chat key={index} {...message} />
