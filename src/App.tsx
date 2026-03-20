@@ -147,6 +147,8 @@ export default function App() {
   const currentTurnKey = createTurnKey(gameState);
   const currentTurnPending =
     pendingChatMessage?.turnKey === currentTurnKey ? pendingChatMessage : null;
+  const pendingChatDisplayMessage =
+    pendingChatMessage?.prefill.content.trim() ? pendingChatMessage.prefill.content : pendingChatMessage?.reasoning ?? '';
   const browserGames = [...savedGames].sort(
     (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
   );
@@ -180,6 +182,16 @@ export default function App() {
     setRequestEpoch((value) => value + 1);
     setIsGamePaused(false);
     setAppState('ready_for_turn');
+  };
+
+  const handleRestartGame = () => {
+    cancelActiveRequest();
+    resetTransientUi();
+    setGameState(initializeGameState(getActiveModels()));
+    setAppState('game_start');
+    setErrorMessage(null);
+    setPendingChatMessage(null);
+    setIsGamePaused(false);
   };
 
   const hydrateSavedGame = (savedGame: SavedGameRecord, forcePaused = true) => {
@@ -459,12 +471,16 @@ export default function App() {
     };
   }, []);
 
-  // Handle scrolling to the bottom of the chat history as chats stream in
+  // Only snap to the bottom when a turn is not actively streaming.
   useEffect(() => {
+    if (appState === 'waiting_for_response' && pendingRequest) {
+      return;
+    }
+
     if (chatContainerRef.current) {
       chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
     }
-  }, [gameState, appState, pendingChatMessage, streamedTokenCount, streamConnected]);
+  }, [appState, gameState, pendingChatMessage, pendingRequest]);
 
   return (
     <div className='flex min-h-screen w-full flex-col bg-gradient-to-br from-slate-800 to-slate-600 antialiased lg:h-screen lg:flex-row lg:overflow-hidden'>
@@ -616,50 +632,59 @@ export default function App() {
           </div>
         </div>
 
-        {/* Start/Pause game button */}
-        <button
-          onClick={() => {
-            const shouldResetGame = appState === 'game_over' || appState === 'error';
-            const nextPausedState = shouldResetGame ? false : !isGamePaused;
-
-            if (shouldResetGame || nextPausedState) {
-              cancelActiveRequest();
-              resetTransientUi();
-            }
-            if (appState === 'game_over' || appState === 'error') {
-              setGameState(
-                initializeGameState(getActiveModels()),
-              );
-              setAppState('game_start');
-              setErrorMessage(null);
-              setPendingChatMessage(null);
-              resetTransientUi();
-            }
-            if (!shouldResetGame && !nextPausedState) {
-              setRequestEpoch((value) => value + 1);
-              setAppState('ready_for_turn');
-            }
-            setIsGamePaused(nextPausedState);
-          }}
-          className='mb-6 flex w-36 items-center justify-center gap-2 rounded bg-slate-200 px-2 py-2 font-bold text-slate-800 hover:bg-slate-300'
-        >
-          {appState === 'game_start' ?
-            <>
-              <Play className='inline size-4' /> Start
-            </>
-            : appState === 'game_over' || appState === 'error' ?
+        {/* Start/Pause game button (+ Restart while paused) */}
+        <div className='mb-6 flex flex-wrap items-center justify-center gap-2'>
+          <button
+            type='button'
+            onClick={() => {
+              const shouldResetGame = appState === 'game_over' || appState === 'error';
+              if (shouldResetGame) {
+                handleRestartGame();
+                return;
+              }
+              const nextPausedState = !isGamePaused;
+              if (nextPausedState) {
+                cancelActiveRequest();
+                resetTransientUi();
+              }
+              if (!nextPausedState) {
+                setRequestEpoch((value) => value + 1);
+                setAppState('ready_for_turn');
+              }
+              setIsGamePaused(nextPausedState);
+            }}
+            className='flex w-36 items-center justify-center gap-2 rounded bg-slate-200 px-2 py-2 font-bold text-slate-800 hover:bg-slate-300'
+          >
+            {appState === 'game_start' ?
               <>
-                <RotateCcw className='inline size-4' /> Restart
+                <Play className='inline size-4' /> Start
               </>
-              : isGamePaused ?
+              : appState === 'game_over' || appState === 'error' ?
                 <>
-                  <Play className='inline size-4' /> Continue
+                  <RotateCcw className='inline size-4' /> Restart
                 </>
-                : <>
-                  <Pause className='inline size-4' /> Pause
-                </>
-          }
-        </button>
+                : isGamePaused ?
+                  <>
+                    <Play className='inline size-4' /> Continue
+                  </>
+                  : <>
+                    <Pause className='inline size-4' /> Pause
+                  </>
+            }
+          </button>
+          {isGamePaused &&
+            appState !== 'game_start' &&
+            appState !== 'game_over' &&
+            appState !== 'error' && (
+              <button
+                type='button'
+                onClick={handleRestartGame}
+                className='flex w-36 items-center justify-center gap-2 rounded border border-slate-400/80 bg-slate-800/50 px-2 py-2 font-bold text-slate-100 hover:bg-slate-700/50'
+              >
+                <RotateCcw className='inline size-4' /> Restart
+              </button>
+            )}
+        </div>
       </div>
 
       {/* Right panel: Chat history */}
@@ -759,9 +784,9 @@ export default function App() {
         ))}
         {pendingRequest &&
           pendingChatMessage &&
-          (streamConnected || pendingChatMessage.reasoning.trim()) && (
+          (streamConnected || pendingChatDisplayMessage.trim()) && (
             <Chat
-              message={pendingChatMessage.reasoning}
+              message={pendingChatDisplayMessage}
               model={gameState.agents[pendingChatMessage.team][pendingChatMessage.role]}
               team={pendingChatMessage.team}
               cards={gameState.cards}

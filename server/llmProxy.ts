@@ -6,7 +6,11 @@ import { generateText, streamText } from 'ai';
 import { OpenRouter } from '@openrouter/sdk';
 import { createRequire } from 'node:module';
 import { jsonrepair } from 'jsonrepair';
-import { modelCatalogById, type Provider, getOpenRouterReasoningEffort } from '../src/utils/modelCatalog.ts';
+import {
+  modelCatalogById,
+  type Provider,
+  getOpenRouterReasoningEffort,
+} from '../src/utils/modelCatalog.ts';
 import { parsePromptContext, type GamePromptContext } from '../src/prompts/userPrompt.ts';
 import {
   createTurnStoreFromEnv,
@@ -1600,7 +1604,7 @@ async function streamOpenRouterModel(
   let finalResponse: unknown = null;
   try {
     inactivityTimeout.reset();
-    const stream = await client.beta.responses.send(
+    const stream = (await client.beta.responses.send(
       {
         openResponsesRequest: createOpenRouterResponseBody(request, { stream: true }),
       },
@@ -1608,7 +1612,7 @@ async function streamOpenRouterModel(
         timeoutMs,
         signal: inactivityTimeout.signal,
       },
-    );
+    )) as AsyncIterable<unknown>;
 
     inactivityTimeout.reset();
 
@@ -2055,7 +2059,7 @@ function createOpenRouterResponseBody(
 
   return {
     model: model.apiModel,
-    maxOutputTokens: 4096,
+    maxOutputTokens: 30_000,
     input: createOpenRouterResponsesInput(request.messages),
     provider: {
       allowFallbacks: true,
@@ -2077,7 +2081,7 @@ function createOpenRouterResponseBody(
   };
 }
 
-function createOpenRouterResponsesInput(messages: Message[]) {
+function createOpenRouterResponsesInput(messages: Message[]): any {
   return messages.flatMap((message) =>
     message.role === 'assistant' ?
       [

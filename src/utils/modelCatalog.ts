@@ -37,9 +37,11 @@ export type LLMModelConfig = {
   };
 };
 
+import { additionalModelCatalog } from './modelCatalogExtras.ts';
+
 export const MIN_ACTIVE_MODELS = 4;
 
-export const allModelCatalog = [
+const baseModelCatalog = [
   {
     id: 'gemini-3.1-pro',
     provider: 'openrouter',
@@ -142,7 +144,7 @@ export const allModelCatalog = [
     openRouterReasoningEnabled: true,
   },
   {
-    id: 'deepseek-v3.2-reasoning',
+    id: 'deepseek-v3-2-reasoning',
     provider: 'openrouter',
     apiModel: 'deepseek/deepseek-v3.2',
     modelName: 'DeepSeek V3.2 Reasoning',
@@ -155,7 +157,7 @@ export const allModelCatalog = [
     openRouterQuantizations: ['fp8', 'fp16'],
   },
   {
-    id: 'deepseek-v3.2',
+    id: 'deepseek-v3-2',
     provider: 'openrouter',
     apiModel: 'deepseek/deepseek-v3.2',
     modelName: 'DeepSeek V3.2',
@@ -232,13 +234,15 @@ export const allModelCatalog = [
   },
 ] as const satisfies readonly LLMModelConfig[];
 
+export const allModelCatalog = [...baseModelCatalog, ...additionalModelCatalog] as const satisfies readonly LLMModelConfig[];
+
 type ModelId = (typeof allModelCatalog)[number]['id'];
 
 export const activeModelIds: readonly ModelId[] = [
   'gemini-3-flash',
   'grok-4.1-fast',
   'qwen3.5-27b-reasoning',
-  'deepseek-v3.2-reasoning',
+  'deepseek-v3-2-reasoning',
 ];
 
 export const allModelCatalogById = Object.fromEntries(
@@ -269,7 +273,7 @@ export function isAutoResumeOnIdleEnabled(model: Pick<LLMModelConfig, 'autoResum
 export function getOpenRouterReasoningEffort(
   model: Pick<LLMModelConfig, 'openRouterReasoningEffort' | 'openRouterReasoningEnabled'>,
 ) {
-  if (model.openRouterReasoningEffort) {
+  if (model.openRouterReasoningEffort && model.openRouterReasoningEffort !== 'none') {
     return model.openRouterReasoningEffort;
   }
 
