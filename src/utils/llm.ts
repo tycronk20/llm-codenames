@@ -28,6 +28,7 @@ type LLMRequest = {
   modelId: string;
   role: Role;
   promptContext?: GamePromptContext;
+  turnId?: string;
 };
 
 type LLMRequestOptions = {
@@ -71,7 +72,7 @@ export type StreamedLLMResponse =
 
 export function createLlmRequest(
   gameState: GameState,
-  assistantPrefill?: AssistantPrefill,
+  turnId?: string,
 ): LLMRequest {
   const promptContext = createPromptContext(gameState);
 
@@ -79,11 +80,12 @@ export function createLlmRequest(
     messages: createMessagesFromPromptContext(
       gameState.currentRole,
       promptContext,
-      assistantPrefill,
+      undefined,
     ),
     modelId: gameState.agents[gameState.currentTeam][gameState.currentRole].id,
     role: gameState.currentRole,
     promptContext,
+    ...(turnId ? { turnId } : {}),
   };
 }
 
@@ -103,12 +105,10 @@ export function createMessagesFromPromptContext(
     },
   ];
 
-  if (
-    assistantPrefill &&
-    (assistantPrefill.content.trim() ||
-      assistantPrefill.reasoningDetails?.length ||
-      assistantPrefill.reasoning?.trim())
-  ) {
+  // Only resume from assistant prefill when we have actual assistant output text.
+  // Resending reasoning-only state as an assistant turn causes some reasoning models
+  // to continue their prior chain instead of answering the current move.
+  if (assistantPrefill && assistantPrefill.content.trim()) {
     messages.push({
       role: 'assistant',
       content: assistantPrefill.content,
@@ -205,116 +205,14 @@ export async function* streamLLMResponse(
       throw new Error(typeof data?.error === 'string' ? data.error : 'LLM stream request failed');
     }
 
-    const reader = response.body?.getReader();
-    if (!reader) {
-      return yield* fallbackStream(request, signal, options, true, () => {
+    return yield* consumeStreamResponse(response, idleMonitor, {
+      onConnect: () => {
         streamConnected = true;
-      });
-    }
-
-    streamConnected = true;
-    idleMonitor.reset();
-    yield { type: 'stream_open' };
-
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let completedMove: SpymasterMove | OperativeMove | null = null;
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) {
-        break;
-      }
-
-      idleMonitor.reset();
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) {
-          continue;
-        }
-
-        const event = safeJsonParse(trimmed);
-        if (!event || typeof event !== 'object' || !('type' in event)) {
-          continue;
-        }
-
-        if (event.type === 'stream_open') {
-          streamConnected = true;
-          idleMonitor.reset();
-          yield { type: 'stream_open' };
-        } else if (event.type === 'progress' && typeof event.tokenCount === 'number') {
-          idleMonitor.reset();
-          yield {
-            type: 'progress',
-            tokenCount: event.tokenCount,
-          };
-        } else if (event.type === 'reasoning_phase' && typeof event.active === 'boolean') {
-          idleMonitor.reset();
-          yield {
-            type: 'reasoning_phase',
-            active: event.active,
-            ...(typeof event.encrypted === 'boolean' ? { encrypted: event.encrypted } : {}),
-          };
-        } else if (
-          event.type === 'reasoning_usage' &&
-          typeof event.reasoningTokens === 'number'
-        ) {
-          idleMonitor.reset();
-          yield {
-            type: 'reasoning_usage',
-            reasoningTokens: event.reasoningTokens,
-          };
-        } else if (
-          event.type === 'prefill' &&
-          event.prefill &&
-          typeof event.prefill === 'object' &&
-          typeof (event.prefill as Record<string, unknown>).content === 'string'
-        ) {
-          idleMonitor.reset();
-          const prefill = event.prefill as Record<string, unknown>;
-          yield {
-            type: 'prefill',
-            prefill: {
-              content: prefill.content as string,
-              reasoning:
-                typeof prefill.reasoning === 'string' ? prefill.reasoning : undefined,
-              reasoningDetails:
-                Array.isArray(prefill.reasoningDetails) ?
-                  (prefill.reasoningDetails as OpenRouterReasoningDetail[])
-                : undefined,
-            },
-          };
-        } else if (event.type === 'reasoning' && typeof event.reasoning === 'string') {
-          idleMonitor.reset();
-          emittedReasoning = true;
-          yield {
-            type: 'reasoning',
-            reasoning: event.reasoning,
-          };
-        } else if (event.type === 'complete' && event.move && typeof event.move === 'object') {
-          idleMonitor.reset();
-          completedMove = event.move as SpymasterMove | OperativeMove;
-          yield {
-            type: 'complete',
-            move: completedMove,
-          };
-        } else if (event.type === 'error' && typeof event.error === 'string') {
-          throw new Error(event.error);
-        }
-      }
-    }
-
-    if (!completedMove) {
-      return yield* fallbackStream(request, signal, options, !emittedReasoning, () => {
-        streamConnected = true;
-      });
-    }
-
-    return completedMove;
+      },
+      onReasoning: () => {
+        emittedReasoning = true;
+      },
+    });
   } catch (error) {
     if (isAbortLikeError(error)) {
       throw error;
@@ -323,6 +221,53 @@ export async function* streamLLMResponse(
     return yield* fallbackStream(request, signal, options, !emittedReasoning, () => {
       streamConnected = true;
     });
+  } finally {
+    idleMonitor.dispose();
+  }
+}
+
+export async function* reconnectLLMResponse(
+  turnId: string,
+  signal?: AbortSignal,
+  options: LLMRequestOptions = {},
+): AsyncGenerator<StreamedLLMResponse, SpymasterMove | OperativeMove, void> {
+  let streamConnected = false;
+  const idleMonitor = createIdleMonitor(
+    turnId,
+    options.onIdleStateChange,
+    () => streamConnected,
+  );
+
+  try {
+    idleMonitor.reset();
+
+    const response = await fetchWithRetry(`/api/llm/stream/${encodeURIComponent(turnId)}`, {
+      method: 'GET',
+      signal,
+    });
+
+    idleMonitor.reset();
+    if (response.status === 204) {
+      throw new Error(`No active turn stream found for ${turnId}.`);
+    }
+    if (!response.ok) {
+      const data = await parseResponseBody(response);
+      throw new Error(
+        typeof data?.error === 'string' ? data.error : 'LLM stream reconnect failed',
+      );
+    }
+
+    return yield* consumeStreamResponse(response, idleMonitor, {
+      onConnect: () => {
+        streamConnected = true;
+      },
+    });
+  } catch (error) {
+    if (isAbortLikeError(error)) {
+      throw error;
+    }
+
+    throw error;
   } finally {
     idleMonitor.dispose();
   }
@@ -339,6 +284,121 @@ async function parseResponseBody(response: Response) {
   } catch {
     return { error: text };
   }
+}
+
+async function* consumeStreamResponse(
+  response: Response,
+  idleMonitor: ReturnType<typeof createIdleMonitor>,
+  options: {
+    onConnect?: () => void;
+    onReasoning?: () => void;
+  } = {},
+): AsyncGenerator<StreamedLLMResponse, SpymasterMove | OperativeMove, void> {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new Error('The response body is empty.');
+  }
+
+  options.onConnect?.();
+  idleMonitor.reset();
+  yield { type: 'stream_open' };
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let completedMove: SpymasterMove | OperativeMove | null = null;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    idleMonitor.reset();
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        continue;
+      }
+
+      const event = safeJsonParse(trimmed);
+      if (!event || typeof event !== 'object' || !('type' in event)) {
+        continue;
+      }
+
+      if (event.type === 'stream_open') {
+        options.onConnect?.();
+        idleMonitor.reset();
+        yield { type: 'stream_open' };
+      } else if (event.type === 'progress' && typeof event.tokenCount === 'number') {
+        idleMonitor.reset();
+        yield {
+          type: 'progress',
+          tokenCount: event.tokenCount,
+        };
+      } else if (event.type === 'reasoning_phase' && typeof event.active === 'boolean') {
+        idleMonitor.reset();
+        yield {
+          type: 'reasoning_phase',
+          active: event.active,
+          ...(typeof event.encrypted === 'boolean' ? { encrypted: event.encrypted } : {}),
+        };
+      } else if (
+        event.type === 'reasoning_usage' &&
+        typeof event.reasoningTokens === 'number'
+      ) {
+        idleMonitor.reset();
+        yield {
+          type: 'reasoning_usage',
+          reasoningTokens: event.reasoningTokens,
+        };
+      } else if (
+        event.type === 'prefill' &&
+        event.prefill &&
+        typeof event.prefill === 'object' &&
+        typeof (event.prefill as Record<string, unknown>).content === 'string'
+      ) {
+        idleMonitor.reset();
+        const prefill = event.prefill as Record<string, unknown>;
+        yield {
+          type: 'prefill',
+          prefill: {
+            content: prefill.content as string,
+            reasoning: typeof prefill.reasoning === 'string' ? prefill.reasoning : undefined,
+            reasoningDetails:
+              Array.isArray(prefill.reasoningDetails) ?
+                (prefill.reasoningDetails as OpenRouterReasoningDetail[])
+              : undefined,
+          },
+        };
+      } else if (event.type === 'reasoning' && typeof event.reasoning === 'string') {
+        idleMonitor.reset();
+        options.onReasoning?.();
+        yield {
+          type: 'reasoning',
+          reasoning: event.reasoning,
+        };
+      } else if (event.type === 'complete' && event.move && typeof event.move === 'object') {
+        idleMonitor.reset();
+        completedMove = event.move as SpymasterMove | OperativeMove;
+        yield {
+          type: 'complete',
+          move: completedMove,
+        };
+      } else if (event.type === 'error' && typeof event.error === 'string') {
+        throw new Error(event.error);
+      }
+    }
+  }
+
+  if (!completedMove) {
+    throw new Error('The LLM stream ended without a move.');
+  }
+
+  return completedMove;
 }
 
 async function* fallbackStream(

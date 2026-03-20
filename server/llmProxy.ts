@@ -8,6 +8,11 @@ import { createRequire } from 'node:module';
 import { jsonrepair } from 'jsonrepair';
 import { modelCatalogById, type Provider, getOpenRouterReasoningEffort } from '../src/utils/modelCatalog.ts';
 import { parsePromptContext, type GamePromptContext } from '../src/prompts/userPrompt.ts';
+import {
+  createTurnStoreFromEnv,
+  type DurableTurnRecord,
+  type TurnStore,
+} from './turnStore.ts';
 
 type Message = {
   role: 'system' | 'user' | 'assistant';
@@ -23,6 +28,7 @@ type LlmApiRequest = {
   messages: Message[];
   role: MoveRole;
   promptContext?: GamePromptContext;
+  turnId?: string;
 };
 
 type JsonObject = Record<string, unknown>;
@@ -140,21 +146,85 @@ const REASONING_TIMEOUT_MS: Record<'medium' | 'high' | 'xhigh', number> = {
   xhigh: 180_000,
 };
 const OPENROUTER_REASONING_TIMEOUT_MS = 150_000;
+const TURN_STREAM_POLL_MS = 500;
+const TURN_LEASE_MS = 30_000;
+const TURN_LEASE_RENEW_INTERVAL_MS = 10_000;
+const TURN_WORKER_POLL_MS = 1_000;
 const LOG_DIR_URL = new URL('../logs/', import.meta.url);
 const RUN_LOG_URL = new URL('../logs/llm-runs.jsonl', import.meta.url);
 const ANTHROPIC_TRANSCRIPT_DIR_URL = new URL('../logs/anthropic-streams/', import.meta.url);
+const TURN_STORE_DIR_URL = new URL('../logs/turns/', import.meta.url);
 
 let logDirectoryReady: Promise<void> | null = null;
 let anthropicTranscriptDirectoryReady: Promise<void> | null = null;
 let processLoggingInstalled = false;
 const require = createRequire(import.meta.url);
 const GOOGLE_GENAI_MODULE = ['@google', 'genai'].join('/');
+type StreamWritable = {
+  statusCode: number;
+  headersSent: boolean;
+  writableEnded: boolean;
+  setHeader(name: string, value: string | number | readonly string[]): unknown;
+  write(chunk: string): unknown;
+  end(chunk?: string): unknown;
+};
 type StreamProviderHandler = (
   request: LlmApiRequest,
   env: Record<string, string>,
-  res: ServerResponse<IncomingMessage>,
+  res: StreamWritable,
   requestId?: string,
 ) => Promise<void>;
+
+class TurnStreamSink implements StreamWritable {
+  readonly turnId: string;
+  private readonly store: TurnStore;
+  statusCode = 200;
+  headersSent = false;
+  writableEnded = false;
+  private writeChain: Promise<void> = Promise.resolve();
+
+  constructor(turnId: string, store: TurnStore) {
+    this.turnId = turnId;
+    this.store = store;
+  }
+
+  setHeader() {
+    return undefined;
+  }
+
+  write(chunk: string) {
+    if (this.writableEnded) {
+      return false;
+    }
+
+    this.headersSent = true;
+    this.enqueueWrite(async () => {
+      await this.store.appendEvent(this.turnId, chunk);
+    });
+    return true;
+  }
+
+  end(chunk?: string) {
+    if (this.writableEnded) {
+      return this;
+    }
+
+    if (chunk) {
+      this.write(chunk);
+    }
+
+    this.writableEnded = true;
+    return this;
+  }
+
+  private enqueueWrite(fn: () => Promise<void>) {
+    this.writeChain = this.writeChain.then(fn, fn);
+  }
+
+  async flushWrites() {
+    await this.writeChain;
+  }
+}
 
 const streamProviderHandlers: Partial<Record<Provider, StreamProviderHandler>> = {
   anthropic: streamAnthropicModel,
@@ -166,6 +236,7 @@ const streamProviderHandlers: Partial<Record<Provider, StreamProviderHandler>> =
 
 export function createLlmApiMiddleware(env: Record<string, string>) {
   installProcessErrorLogging();
+  const turnStore = createTurnStoreFromEnv(env, TURN_STORE_DIR_URL);
 
   return async (
     req: IncomingMessage,
@@ -173,72 +244,43 @@ export function createLlmApiMiddleware(env: Record<string, string>) {
     next: (err?: unknown) => void,
   ) => {
     if (req.method === 'POST' && req.url === '/api/llm/stream') {
-      const requestId = randomUUID().slice(0, 8);
-      const startedAt = Date.now();
-      let request: LlmApiRequest | null = null;
-
       try {
-        request = parseRequest(await readJsonBody(req));
-        const model = modelCatalogById[request.modelId];
-        const timeoutMs = getProviderTimeoutMs(request.modelId);
-
-        await writeRunLog({
-          requestId,
-          event: 'request_started',
-          modelId: request.modelId,
-          provider: model?.provider,
-          role: request.role,
-          stream: true,
-          timeoutMs,
-          ...summarizeRequest(request),
+        const request = parseRequest(await readJsonBody(req));
+        const turnId = request.turnId ?? randomUUID().slice(0, 8);
+        const timestamp = new Date().toISOString();
+        await turnStore.createTurn({
+          id: turnId,
+          requestId: randomUUID().slice(0, 8),
+          status: 'queued',
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          request: {
+            ...request,
+            turnId,
+          },
         });
-
-        await streamStructuredMove(request, env, res, requestId);
-
-        await writeRunLog({
-          requestId,
-          event: 'request_succeeded',
-          modelId: request.modelId,
-          provider: model?.provider,
-          role: request.role,
-          stream: true,
-          durationMs: Date.now() - startedAt,
-        });
+        await streamPersistedTurn(turnId, res, turnStore);
       } catch (error) {
         console.error('[llm-proxy] stream request failed:', error);
-        await writeRunLog({
-          requestId,
-          event: 'request_failed',
-          modelId: request?.modelId,
-          provider: request ? modelCatalogById[request.modelId]?.provider : undefined,
-          role: request?.role,
-          stream: true,
-          durationMs: Date.now() - startedAt,
-          timeoutMs: request ? getProviderTimeoutMs(request.modelId) : undefined,
-          error: getClientErrorMessage(
-            error,
-            request?.modelId,
-            request ? getProviderTimeoutMs(request.modelId) : undefined,
-          ),
-          ...(request ? summarizeRequest(request) : {}),
-        });
         if (!res.headersSent) {
           writeJson(res, isTimeoutError(error) ? 504 : 500, {
-            error: getClientErrorMessage(error, request?.modelId, request ? getProviderTimeoutMs(request.modelId) : undefined),
+            error: getClientErrorMessage(error),
           });
         } else {
           writeNdjsonEvent(res, {
             type: 'error',
-            error: getClientErrorMessage(
-              error,
-              request?.modelId,
-              request ? getProviderTimeoutMs(request.modelId) : undefined,
-            ),
+            error: getClientErrorMessage(error),
           });
           res.end();
         }
       }
 
+      return;
+    }
+
+    if (req.method === 'GET' && req.url?.startsWith('/api/llm/stream/')) {
+      const turnId = decodeURIComponent(req.url.slice('/api/llm/stream/'.length));
+      await streamPersistedTurn(turnId, res, turnStore);
       return;
     }
 
@@ -370,6 +412,217 @@ function installProcessErrorLogging() {
   });
 }
 
+async function streamPersistedTurn(
+  turnId: string,
+  res: ServerResponse<IncomingMessage>,
+  store: TurnStore,
+) {
+  const snapshot = await store.load(turnId);
+  if (!snapshot) {
+    res.statusCode = 204;
+    res.end();
+    return;
+  }
+
+  openNdjsonStream(res);
+  for (const eventLine of snapshot.events) {
+    res.write(eventLine);
+  }
+
+  let lastEventSeq = snapshot.lastEventSeq;
+  if (isTerminalTurnStatus(snapshot.record.status)) {
+    res.end();
+    return;
+  }
+
+  const handleClose = () => {
+    res.off('close', handleClose);
+  };
+  res.on('close', handleClose);
+
+  while (!res.writableEnded) {
+    const abandoned = await store.abandonExpiredTurn(
+      turnId,
+      'Turn worker lease expired before completion.',
+    );
+    const nextSnapshot = await store.loadAfter(turnId, lastEventSeq);
+    if (!nextSnapshot) {
+      res.end();
+      return;
+    }
+
+    for (const eventLine of nextSnapshot.events) {
+      if (res.writableEnded) {
+        return;
+      }
+      res.write(eventLine);
+    }
+
+    lastEventSeq = nextSnapshot.lastEventSeq;
+    if (isTerminalTurnStatus(nextSnapshot.record.status) || abandoned) {
+      res.end();
+      return;
+    }
+
+    await delay(TURN_STREAM_POLL_MS);
+  }
+}
+
+export function startTurnWorker(
+  env: Record<string, string>,
+  options: {
+    store?: TurnStore;
+    workerId?: string;
+    pollMs?: number;
+    leaseMs?: number;
+    leaseRenewIntervalMs?: number;
+  } = {},
+) {
+  installProcessErrorLogging();
+
+  const store = options.store ?? createTurnStoreFromEnv(env, TURN_STORE_DIR_URL);
+  const workerId = options.workerId ?? `worker-${randomUUID().slice(0, 8)}`;
+  const pollMs = options.pollMs ?? TURN_WORKER_POLL_MS;
+  const leaseMs = options.leaseMs ?? TURN_LEASE_MS;
+  const leaseRenewIntervalMs = options.leaseRenewIntervalMs ?? TURN_LEASE_RENEW_INTERVAL_MS;
+  let running = true;
+  let loopPromise: Promise<void> | null = null;
+
+  const loop = async () => {
+    while (running) {
+      try {
+        const record = await store.claimNextQueuedTurn(workerId, leaseMs);
+        if (!record) {
+          await delay(pollMs);
+          continue;
+        }
+
+        await runClaimedTurn(record, env, store, workerId, leaseMs, leaseRenewIntervalMs);
+      } catch (error) {
+        console.error('[llm-worker] worker loop failed:', error);
+        await delay(pollMs);
+      }
+    }
+  };
+
+  loopPromise = loop();
+
+  return {
+    workerId,
+    stop: async () => {
+      running = false;
+      await loopPromise;
+    },
+  };
+}
+
+async function runClaimedTurn(
+  record: DurableTurnRecord,
+  env: Record<string, string>,
+  store: TurnStore,
+  workerId: string,
+  leaseMs: number,
+  leaseRenewIntervalMs: number,
+) {
+  const request = parseRequest(record.request);
+  const startedAt = Date.now();
+  const requestId = record.requestId;
+  const model = modelCatalogById[request.modelId];
+  const timeoutMs = getProviderTimeoutMs(request.modelId);
+  const sink = new TurnStreamSink(record.id, store);
+
+  const renewTimer = setInterval(() => {
+    void store.renewLease(record.id, workerId, leaseMs);
+  }, leaseRenewIntervalMs);
+
+  try {
+    await writeRunLog({
+      requestId,
+      event: 'request_started',
+      modelId: request.modelId,
+      provider: model?.provider,
+      role: request.role,
+      stream: true,
+      timeoutMs,
+      ...summarizeRequest(request),
+    });
+
+    await streamStructuredMove(request, env, sink, requestId);
+    await sink.flushWrites();
+    await store.saveRecord({
+      ...record,
+      request,
+      status: 'completed',
+      updatedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      workerId,
+      leaseExpiresAt: undefined,
+      startedAt: record.startedAt ?? new Date(startedAt).toISOString(),
+      error: undefined,
+    });
+
+    await writeRunLog({
+      requestId,
+      event: 'request_succeeded',
+      modelId: request.modelId,
+      provider: model?.provider,
+      role: request.role,
+      stream: true,
+      durationMs: Date.now() - startedAt,
+    });
+  } catch (error) {
+    console.error('[llm-worker] turn failed:', error);
+    const errorMessage = getClientErrorMessage(error, request.modelId, timeoutMs);
+
+    if (!sink.writableEnded) {
+      openNdjsonStream(sink);
+      writeStreamOpenEvent(sink);
+      writeNdjsonEvent(sink, {
+        type: 'error',
+        error: errorMessage,
+      });
+      sink.end();
+    }
+
+    await sink.flushWrites();
+    await store.saveRecord({
+      ...record,
+      request,
+      status: 'failed',
+      updatedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      workerId,
+      leaseExpiresAt: undefined,
+      startedAt: record.startedAt ?? new Date(startedAt).toISOString(),
+      error: errorMessage,
+    });
+    await writeRunLog({
+      requestId,
+      event: 'request_failed',
+      modelId: request.modelId,
+      provider: model?.provider,
+      role: request.role,
+      stream: true,
+      durationMs: Date.now() - startedAt,
+      timeoutMs,
+      error: errorMessage,
+      ...summarizeRequest(request),
+    });
+  } finally {
+    clearInterval(renewTimer);
+  }
+}
+
+function isTerminalTurnStatus(status: DurableTurnRecord['status']) {
+  return status === 'completed' || status === 'failed' || status === 'abandoned';
+}
+
+function delay(ms: number) {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 async function fetchStructuredMove(
   request: LlmApiRequest,
   env: Record<string, string>,
@@ -450,7 +703,7 @@ async function fetchStructuredMove(
 async function streamStructuredMove(
   request: LlmApiRequest,
   env: Record<string, string>,
-  res: ServerResponse<IncomingMessage>,
+  res: StreamWritable,
   requestId?: string,
 ) {
   const model = modelCatalogById[request.modelId];
@@ -490,7 +743,7 @@ async function streamStructuredMove(
 async function streamResolvedMove(
   request: LlmApiRequest,
   env: Record<string, string>,
-  res: ServerResponse<IncomingMessage>,
+  res: StreamWritable,
   requestId?: string,
   originalError?: unknown,
 ) {
@@ -598,12 +851,9 @@ async function callOpenRouterModel(
   requestId?: string,
 ) {
   const client = createOpenRouterClient(request.modelId, env);
-  const response = await client.chat.send(
+  const response = await client.beta.responses.send(
     {
-      chatGenerationParams:
-        createOpenRouterChatParams(request) as import('@openrouter/sdk/models').ChatGenerationParams & {
-          stream?: false;
-        },
+      openResponsesRequest: createOpenRouterResponseBody(request),
     },
     {
       timeoutMs: getProviderTimeoutMs(request.modelId),
@@ -616,7 +866,7 @@ async function callOpenRouterModel(
 async function streamOpenAiModel(
   request: LlmApiRequest,
   env: Record<string, string>,
-  res: ServerResponse<IncomingMessage>,
+  res: StreamWritable,
   requestId?: string,
 ) {
   const model = modelCatalogById[request.modelId];
@@ -714,7 +964,7 @@ async function streamOpenAiModel(
 async function streamAnthropicModel(
   request: LlmApiRequest,
   env: Record<string, string>,
-  res: ServerResponse<IncomingMessage>,
+  res: StreamWritable,
   requestId?: string,
 ) {
   const model = modelCatalogById[request.modelId];
@@ -1037,7 +1287,7 @@ async function recoverOpenRouterMoveFromNonStream(
 async function streamGoogleModel(
   request: LlmApiRequest,
   env: Record<string, string>,
-  res: ServerResponse<IncomingMessage>,
+  res: StreamWritable,
   requestId?: string,
 ) {
   const model = modelCatalogById[request.modelId];
@@ -1166,7 +1416,7 @@ function hasXaiEncryptedReasoningMetadata(part: { providerMetadata?: unknown }) 
 async function streamXaiModel(
   request: LlmApiRequest,
   env: Record<string, string>,
-  res: ServerResponse<IncomingMessage>,
+  res: StreamWritable,
   requestId?: string,
 ) {
   const model = modelCatalogById[request.modelId];
@@ -1319,7 +1569,7 @@ async function streamXaiModel(
 async function streamOpenRouterModel(
   request: LlmApiRequest,
   env: Record<string, string>,
-  res: ServerResponse<IncomingMessage>,
+  res: StreamWritable,
   requestId?: string,
 ) {
   const model = modelCatalogById[request.modelId];
@@ -1343,17 +1593,16 @@ async function streamOpenRouterModel(
   const isPrefill = lastMessage?.role === 'assistant';
   let reasoningText = isPrefill ? lastMessage.reasoning || '' : '';
   let outputText = isPrefill ? lastMessage.content || '' : '';
-  const reasoningDetails: OpenRouterReasoningDetail[] = isPrefill && lastMessage.reasoningDetails ? lastMessage.reasoningDetails : [];
+  const reasoningDetails: OpenRouterReasoningDetail[] =
+    isPrefill && lastMessage.reasoningDetails ? [...lastMessage.reasoningDetails] : [];
   let streamedText = isPrefill ? `${lastMessage.reasoning || ''}${lastMessage.content || ''}` : '';
   let sseEventCount = 0;
+  let finalResponse: unknown = null;
   try {
     inactivityTimeout.reset();
-    const streamOrResponse = await client.chat.send(
+    const stream = await client.beta.responses.send(
       {
-        chatGenerationParams:
-          createOpenRouterChatParams(request, { stream: true }) as import('@openrouter/sdk/models').ChatGenerationParams & {
-            stream: true;
-          },
+        openResponsesRequest: createOpenRouterResponseBody(request, { stream: true }),
       },
       {
         timeoutMs,
@@ -1363,83 +1612,66 @@ async function streamOpenRouterModel(
 
     inactivityTimeout.reset();
 
-    if (!isAsyncIterable(streamOrResponse)) {
-      const move = await resolveOpenRouterMove(request, env, streamOrResponse, requestId);
-      openNdjsonStream(res);
-      writeStreamOpenEvent(res);
-      writeNdjsonEvent(res, {
-        type: 'reasoning',
-        reasoning: move.reasoning,
-      });
-      writeNdjsonEvent(res, {
-        type: 'complete',
-        move,
-      });
-      res.end();
-
-      if (requestId) {
-        await writeRunLog({
-          requestId,
-          event: 'provider_succeeded',
-          modelId: request.modelId,
-          provider: model?.provider,
-          role: request.role,
-          stream: true,
-          durationMs: Date.now() - startedAt,
-          timeoutMs,
-          sseEventCount,
-          ...summarizeMove(move),
-        });
-      }
-
-      return;
-    }
-
     openNdjsonStream(res);
     writeStreamOpenEvent(res);
 
-    for await (const chunk of streamOrResponse) {
+    for await (const event of stream) {
       inactivityTimeout.reset();
       sseEventCount++;
 
-      if (!chunk || typeof chunk !== 'object') {
+      if (!event || typeof event !== 'object') {
         continue;
       }
 
-      const chunkError = getOpenRouterChunkError(chunk as Record<string, unknown>);
-      if (chunkError) {
-        throw new Error(`OpenRouter API error: ${chunkError}`);
+      const chunk = event as Record<string, unknown>;
+      if (chunk.type === 'error' || chunk.type === 'response.failed') {
+        throw new Error(getOpenRouterResponsesEventError(chunk) ?? 'OpenRouter API error.');
       }
 
-      const delta = getOpenRouterChoiceDelta(chunk as Record<string, unknown>);
-      if (!delta) {
-        continue;
+      if (
+        (chunk.type === 'response.output_item.added' || chunk.type === 'response.output_item.done') &&
+        chunk.item &&
+        typeof chunk.item === 'object'
+      ) {
+        upsertOpenRouterReasoningDetail(reasoningDetails, chunk.item as Record<string, unknown>);
+        if (reasoningDetails.length > 0 || outputText) {
+          writeNdjsonEvent(res, {
+            type: 'prefill',
+            prefill: {
+              content: outputText,
+              reasoning: reasoningText.trimEnd(),
+              reasoningDetails,
+            },
+          });
+        }
       }
 
-      const reasoningDetailsDelta = getOpenRouterReasoningDetails(delta);
-      if (reasoningDetailsDelta.length > 0) {
-        reasoningDetails.push(...reasoningDetailsDelta);
-      }
-
-      const reasoningDelta = extractOpenRouterReasoningText(delta, '');
-      if (reasoningDelta) {
-        reasoningText += reasoningDelta;
-        streamedText += reasoningDelta;
+      if (chunk.type === 'response.reasoning_summary_text.delta' && typeof chunk.delta === 'string') {
+        reasoningText += chunk.delta;
+        streamedText += chunk.delta;
         writeProgressEvent(res, streamedText);
         writeNdjsonEvent(res, {
           type: 'reasoning',
           reasoning: reasoningText.trimEnd(),
         });
+        continue;
       }
 
-      const outputDelta = extractOpenRouterContentText(delta);
-      if (outputDelta) {
-        outputText += outputDelta;
-        streamedText += outputDelta;
+      if (chunk.type === 'response.reasoning_text.delta' && typeof chunk.delta === 'string') {
+        reasoningText += chunk.delta;
+        streamedText += chunk.delta;
         writeProgressEvent(res, streamedText);
+        writeNdjsonEvent(res, {
+          type: 'reasoning',
+          reasoning: reasoningText.trimEnd(),
+        });
+        continue;
       }
 
-      if (reasoningDetailsDelta.length > 0 || outputDelta) {
+      if (chunk.type === 'response.output_text.delta' && typeof chunk.delta === 'string') {
+        outputText += chunk.delta;
+        streamedText += chunk.delta;
+        writeProgressEvent(res, streamedText);
         writeNdjsonEvent(res, {
           type: 'prefill',
           prefill: {
@@ -1448,18 +1680,29 @@ async function streamOpenRouterModel(
             reasoningDetails,
           },
         });
+        continue;
+      }
+
+      if (
+        (chunk.type === 'response.completed' || chunk.type === 'response.incomplete') &&
+        chunk.response &&
+        typeof chunk.response === 'object'
+      ) {
+        finalResponse = chunk.response;
       }
     }
 
     const move =
-      outputText.trim() ?
+      finalResponse ?
+        await resolveOpenRouterMove(request, env, finalResponse, requestId)
+      : outputText.trim() ?
         await resolveMoveWithFormatRepair(request, env, {
           requestId,
           source: 'openrouter_stream',
           output: outputText,
           reasoning: reasoningText.trim(),
         })
-        : await recoverOpenRouterMoveFromNonStream(request, env, requestId, 'empty_stream_output');
+      : await recoverOpenRouterMoveFromNonStream(request, env, requestId, 'empty_stream_output');
 
     if (requestId) {
       await writeRunLog({
@@ -1800,7 +2043,7 @@ function createOpenRouterClient(modelId: string, env: Record<string, string>) {
   });
 }
 
-function createOpenRouterChatParams(
+function createOpenRouterResponseBody(
   request: LlmApiRequest,
   options?: {
     stream?: boolean;
@@ -1812,31 +2055,21 @@ function createOpenRouterChatParams(
 
   return {
     model: model.apiModel,
-    maxTokens: 4096,
-    messages: request.messages.map((message) =>
-      message.role === 'assistant' ?
-        {
-          role: 'assistant' as const,
-          content: message.content,
-          ...(message.reasoningDetails?.length ?
-            {
-              reasoningDetails: message.reasoningDetails,
-            }
-            : {}),
-        }
-      : {
-          role: message.role,
-          content: message.content,
-        },
-    ),
+    maxOutputTokens: 4096,
+    input: createOpenRouterResponsesInput(request.messages),
     provider: {
       allowFallbacks: true,
       ...(model.openRouterQuantizations?.length ?
         { quantizations: [...model.openRouterQuantizations] }
         : {}),
     },
-    responseFormat: {
-      type: 'json_object' as const,
+    text: {
+      format: {
+        type: 'json_schema' as const,
+        name: `${request.role}_move`,
+        strict: true,
+        schema: moveSchemas[request.role],
+      },
     },
     ...(stream ? { stream: true } : {}),
     ...(!stream ? { plugins: [{ id: 'response-healing' as const }] } : {}),
@@ -1844,15 +2077,60 @@ function createOpenRouterChatParams(
   };
 }
 
-function parseOpenAiResponsesPayload(payload: unknown) {
+function createOpenRouterResponsesInput(messages: Message[]) {
+  return messages.flatMap((message) =>
+    message.role === 'assistant' ?
+      [
+        ...(message.reasoningDetails?.filter(
+          (detail): detail is OpenRouterReasoningDetail => !!detail && typeof detail === 'object',
+        ) ?? []),
+        {
+          role: 'assistant' as const,
+          content: message.content,
+        },
+      ]
+    : [
+        {
+          role: message.role,
+          content: message.content,
+        },
+      ],
+  );
+}
+
+function parseResponsesPayload(payload: unknown) {
   if (!payload || typeof payload !== 'object') {
-    throw new Error('OpenAI response payload was empty.');
+    throw new Error('Responses payload was empty.');
   }
 
   const response = payload as Record<string, unknown>;
+  const outputText = getResponsesOutputText(response);
+  if (!outputText) {
+    throw new Error('Responses payload did not include output text.');
+  }
+
+  const parsedMove = parseJsonContent(outputText) as Record<string, unknown>;
+  const reasoningSummary = extractResponsesReasoningText(response, '\n\n');
+
+  if (reasoningSummary) {
+    parsedMove.reasoning = reasoningSummary;
+  }
+
+  return parsedMove;
+}
+
+function parseOpenAiResponsesPayload(payload: unknown) {
+  return parseResponsesPayload(payload);
+}
+
+function getResponsesOutputText(response: Record<string, unknown>) {
+  if (typeof response.outputText === 'string' && response.outputText.trim()) {
+    return response.outputText.trim();
+  }
+
   const output = Array.isArray(response.output) ? response.output : [];
 
-  const outputText = output
+  return output
     .filter(
       (item) =>
         item &&
@@ -1867,33 +2145,6 @@ function parseOpenAiResponsesPayload(payload: unknown) {
     .map((part) => part.text as string)
     .join('\n')
     .trim();
-
-  if (!outputText) {
-    throw new Error('OpenAI response did not include output text.');
-  }
-
-  const parsedMove = parseJsonContent(outputText) as Record<string, unknown>;
-  const reasoningSummary = output
-    .filter(
-      (item) =>
-        item &&
-        typeof item === 'object' &&
-        'type' in item &&
-        item.type === 'reasoning' &&
-        'summary' in item &&
-        Array.isArray(item.summary),
-    )
-    .flatMap((item) => (item as { summary: Array<{ type?: string; text?: string }> }).summary)
-    .filter((part) => part.type === 'summary_text' && typeof part.text === 'string')
-    .map((part) => part.text as string)
-    .join('\n\n')
-    .trim();
-
-  if (reasoningSummary) {
-    parsedMove.reasoning = reasoningSummary;
-  }
-
-  return parsedMove;
 }
 
 function parseGoogleGenerateContentPayload(payload: unknown) {
@@ -1916,23 +2167,6 @@ function parseGoogleGenerateContentPayload(payload: unknown) {
   return parsedMove;
 }
 
-function parseOpenRouterChatPayload(payload: unknown) {
-  if (!payload || typeof payload !== 'object') {
-    throw new Error('OpenRouter response payload was empty.');
-  }
-
-  const response = payload as Record<string, unknown>;
-  const message = getOpenRouterChoiceMessage(response);
-  const parsedMove = parseJsonContent(message?.content) as Record<string, unknown>;
-  const reasoning = extractOpenRouterReasoningText(message, '\n\n');
-
-  if (reasoning) {
-    parsedMove.reasoning = reasoning;
-  }
-
-  return parsedMove;
-}
-
 async function resolveOpenRouterMove(
   request: LlmApiRequest,
   env: Record<string, string>,
@@ -1944,13 +2178,12 @@ async function resolveOpenRouterMove(
   }
 
   const response = payload as Record<string, unknown>;
-  const message = getOpenRouterChoiceMessage(response);
 
   return resolveMoveWithFormatRepair(request, env, {
     requestId,
     source: 'openrouter_nonstream',
-    output: message?.content,
-    reasoning: extractOpenRouterReasoningText(message, '\n\n').trim(),
+    output: getResponsesOutputText(response),
+    reasoning: extractResponsesReasoningText(response, '\n\n').trim(),
   });
 }
 
@@ -2018,20 +2251,25 @@ async function repairMoveFormatWithQwen(
   } = {
     effort: 'medium',
   };
-  const response = await client.chat.send(
+  const response = await client.beta.responses.send(
     {
-      chatGenerationParams: {
+      openResponsesRequest: {
         model: 'x-ai/grok-4.1-fast',
-        maxTokens: 600,
-        messages: createRepairMessages(request, options).map((message) => ({
+        maxOutputTokens: 600,
+        input: createRepairMessages(request, options).map((message) => ({
           role: message.role,
           content: message.content,
         })),
         provider: {
           allowFallbacks: true,
         },
-        responseFormat: {
-          type: 'json_object' as const,
+        text: {
+          format: {
+            type: 'json_schema' as const,
+            name: `${request.role}_repair`,
+            strict: true,
+            schema: moveSchemas[request.role],
+          },
         },
         plugins: [{ id: 'response-healing' as const }],
         reasoning: repairReasoning,
@@ -2042,7 +2280,7 @@ async function repairMoveFormatWithQwen(
     },
   );
 
-  const repairedPayload = parseOpenRouterChatPayload(response);
+  const repairedPayload = parseResponsesPayload(response);
   const repairedMove = normalizeMove(request.role, repairedPayload);
 
   if (options.requestId) {
@@ -2203,51 +2441,62 @@ function parseJsonContent(content: unknown) {
   return JSON.parse(jsonrepair(candidate));
 }
 
-function getOpenRouterChoiceMessage(payload: Record<string, unknown>) {
-  const firstChoice = Array.isArray(payload.choices) ? payload.choices[0] : undefined;
-  if (!firstChoice || typeof firstChoice !== 'object' || !('message' in firstChoice)) {
-    return undefined;
-  }
-
-  const { message } = firstChoice as { message?: unknown };
-  return message && typeof message === 'object' ? (message as Record<string, unknown>) : undefined;
+function extractResponsesReasoningText(payload: Record<string, unknown>, joiner: string) {
+  const output = Array.isArray(payload.output) ? payload.output : [];
+  return extractOpenRouterReasoningDetailsText(output, joiner);
 }
 
-function getOpenRouterChoiceDelta(payload: Record<string, unknown>) {
-  const firstChoice = Array.isArray(payload.choices) ? payload.choices[0] : undefined;
-  if (!firstChoice || typeof firstChoice !== 'object' || !('delta' in firstChoice)) {
-    return undefined;
+function upsertOpenRouterReasoningDetail(
+  reasoningDetails: OpenRouterReasoningDetail[],
+  item: Record<string, unknown>,
+) {
+  if (item.type !== 'reasoning') {
+    return;
   }
 
-  const { delta } = firstChoice as { delta?: unknown };
-  return delta && typeof delta === 'object' ? (delta as Record<string, unknown>) : undefined;
-}
-
-function extractOpenRouterReasoningText(payload: Record<string, unknown> | undefined, joiner: string) {
-  if (!payload) {
-    return '';
+  const nextDetail = { ...item };
+  const itemId = typeof item.id === 'string' ? item.id : null;
+  if (!itemId) {
+    reasoningDetails.push(nextDetail);
+    return;
   }
 
-  const detailsText = extractOpenRouterReasoningDetailsText(
-    payload.reasoningDetails ?? payload.reasoning_details,
-    joiner,
+  const existingIndex = reasoningDetails.findIndex(
+    (detail) => typeof detail.id === 'string' && detail.id === itemId,
   );
-  if (detailsText) {
-    return detailsText;
+
+  if (existingIndex === -1) {
+    reasoningDetails.push(nextDetail);
+    return;
   }
 
-  return typeof payload.reasoning === 'string' ? payload.reasoning : '';
+  reasoningDetails[existingIndex] = nextDetail;
 }
 
-function getOpenRouterReasoningDetails(payload: Record<string, unknown> | undefined) {
-  const reasoningDetails = payload?.reasoningDetails ?? payload?.reasoning_details;
-  if (!Array.isArray(reasoningDetails)) {
-    return [];
+function getOpenRouterResponsesEventError(payload: Record<string, unknown>) {
+  const error = payload.error;
+  if (typeof error === 'string') {
+    return error;
   }
 
-  return reasoningDetails
-    .filter((detail): detail is OpenRouterReasoningDetail => !!detail && typeof detail === 'object')
-    .map((detail) => ({ ...detail }));
+  if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') {
+    return error.message;
+  }
+
+  const response = payload.response;
+  if (
+    response &&
+    typeof response === 'object' &&
+    'error' in response &&
+    response.error &&
+    typeof response.error === 'object' &&
+    'message' in response.error &&
+    typeof response.error.message === 'string'
+  ) {
+    return response.error.message;
+  }
+
+  return '';
 }
 
 function extractGoogleThoughtText(payload: unknown, joiner: string) {
@@ -2314,7 +2563,7 @@ function extractOpenRouterReasoningDetailsText(reasoningDetails: unknown, joiner
       }
 
       if ('summary' in detail && Array.isArray(detail.summary)) {
-        return detail.summary
+        const summaryText = detail.summary
           .map((part: unknown) =>
             part && typeof part === 'object' && 'text' in part && typeof part.text === 'string' ?
               part.text
@@ -2322,50 +2571,29 @@ function extractOpenRouterReasoningDetailsText(reasoningDetails: unknown, joiner
           )
           .filter(Boolean)
           .join(joiner);
+        if (summaryText) {
+          return summaryText;
+        }
+      }
+
+      if ('content' in detail && Array.isArray(detail.content)) {
+        const contentText = detail.content
+          .map((part: unknown) =>
+            part && typeof part === 'object' && 'text' in part && typeof part.text === 'string' ?
+              part.text
+              : '',
+          )
+          .filter(Boolean)
+          .join(joiner);
+        if (contentText) {
+          return contentText;
+        }
       }
 
       return 'text' in detail && typeof detail.text === 'string' ? detail.text : '';
     })
     .filter(Boolean)
     .join(joiner);
-}
-
-function extractOpenRouterContentText(payload: Record<string, unknown>) {
-  const { content } = payload;
-
-  if (typeof content === 'string') {
-    return content;
-  }
-
-  if (!Array.isArray(content)) {
-    return '';
-  }
-
-  return content
-    .map((part) =>
-      typeof part === 'string' ? part
-        : part && typeof part === 'object' && 'text' in part && typeof part.text === 'string' ?
-          part.text
-          : '',
-    )
-    .join('');
-}
-
-function getOpenRouterChunkError(payload: Record<string, unknown>) {
-  const error = payload.error;
-  if (typeof error === 'string') {
-    return error;
-  }
-
-  if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') {
-    return error.message;
-  }
-
-  return '';
-}
-
-function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
-  return !!value && typeof value === 'object' && Symbol.asyncIterator in value;
 }
 
 async function* readSseData(
@@ -2463,6 +2691,9 @@ function parseRequest(payload: unknown): LlmApiRequest {
     modelId,
     messages: messages.map((message) => parseMessage(message)),
     promptContext: parsePromptContext(request.promptContext),
+    ...(typeof request.turnId === 'string' ?
+      { turnId: request.turnId }
+      : {}),
   };
 }
 
@@ -2559,22 +2790,22 @@ function writeJson(res: ServerResponse<IncomingMessage>, statusCode: number, bod
   res.end(JSON.stringify(body));
 }
 
-function openNdjsonStream(res: ServerResponse<IncomingMessage>) {
+function openNdjsonStream(res: StreamWritable) {
   res.statusCode = 200;
   res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
 }
 
-function writeStreamOpenEvent(res: ServerResponse<IncomingMessage>) {
+function writeStreamOpenEvent(res: StreamWritable) {
   writeNdjsonEvent(res, { type: 'stream_open' });
 }
 
-function writeNdjsonEvent(res: ServerResponse<IncomingMessage>, event: unknown) {
+function writeNdjsonEvent(res: StreamWritable, event: unknown) {
   res.write(`${JSON.stringify(event)}\n`);
 }
 
-function writeProgressEvent(res: ServerResponse<IncomingMessage>, streamedText: string) {
+function writeProgressEvent(res: StreamWritable, streamedText: string) {
   writeNdjsonEvent(res, {
     type: 'progress',
     tokenCount: estimateTokenCount(streamedText),

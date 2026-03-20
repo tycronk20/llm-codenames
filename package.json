@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "bunx --bun vite",
+    "dev:worker": "bun server/turnWorker.ts",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "worker": "bun server/turnWorker.ts"
   },
   "dependencies": {
     "@ai-sdk/xai": "^3.0.67",
@@ -19,6 +21,7 @@
     "jsonrepair": "^3.11.0",
     "lucide-react": "^0.456.0",
     "openai": "6.31.0",
+    "pg": "^8.16.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "zod": "^4.3.6"
@@ -27,6 +30,7 @@
     "@eslint/js": "^9.15.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
+    "@types/pg": "^8.15.5",
     "@vitejs/plugin-react-swc": "^4.3.0",
     "autoprefixer": "^10.4.20",
     "eslint": "^9.15.0",

@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execSync, spawn, type ChildProcess } from 'child_process';
 import react from '@vitejs/plugin-react-swc';
 import type { Plugin, PreviewServer, ViteDevServer } from 'vite';
 import { defineConfig, loadEnv } from 'vite';
@@ -37,6 +37,49 @@ function portGuardPlugin(defaultPort: number): Plugin {
   };
 }
 
+function turnWorkerPlugin(): Plugin {
+  let workerProcess: ChildProcess | null = null;
+
+  const startWorker = () => {
+    if (process.env.LLM_AUTO_START_WORKER === '0' || workerProcess) {
+      return;
+    }
+
+    workerProcess = spawn('bun', ['server/turnWorker.ts'], {
+      stdio: 'inherit',
+      env: process.env,
+    });
+
+    const clearWorker = () => {
+      workerProcess = null;
+    };
+
+    workerProcess.once('exit', clearWorker);
+    workerProcess.once('close', clearWorker);
+  };
+
+  const stopWorker = () => {
+    if (!workerProcess) {
+      return;
+    }
+
+    workerProcess.kill('SIGTERM');
+    workerProcess = null;
+  };
+
+  return {
+    name: 'turn-worker',
+    configureServer(server: ViteDevServer) {
+      startWorker();
+      server.httpServer?.once('close', stopWorker);
+    },
+    configurePreviewServer(server: PreviewServer) {
+      startWorker();
+      server.httpServer?.once('close', stopWorker);
+    },
+  };
+}
+
 export default defineConfig(async ({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   const { createLlmApiMiddleware } = await import('./server/llmProxy.ts');
@@ -53,6 +96,7 @@ export default defineConfig(async ({ mode }) => {
     },
     plugins: [
       portGuardPlugin(DEFAULT_PORT),
+      turnWorkerPlugin(),
       react(),
       {
         name: 'llm-api',

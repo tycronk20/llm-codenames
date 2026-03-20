@@ -26,6 +26,7 @@ import {
 import {
   AssistantPrefill,
   createLlmRequest,
+  reconnectLLMResponse,
   streamLLMResponse,
 } from './utils/llm';
 import {
@@ -38,10 +39,6 @@ import {
 import {
   getActiveModels,
 } from './utils/models';
-import {
-  isAssistantPrefillEnabled,
-  isAutoResumeOnIdleEnabled,
-} from './utils/modelCatalog';
 
 type AppState = 'game_start' | 'ready_for_turn' | 'waiting_for_response' | 'error' | 'game_over';
 type PendingRequest = {
@@ -49,13 +46,14 @@ type PendingRequest = {
   team: GameState['currentTeam'];
   role: GameState['currentRole'];
   startedAt: number;
-  resumeMode: 'fresh' | 'prefill' | 'prefill-disabled';
+  resumeMode: 'fresh' | 'resume';
 };
 type PartialChatMessage = {
   turnKey: string;
   team: PendingRequest['team'];
   role: PendingRequest['role'];
   reasoning: string;
+  turnId?: string;
   prefill: AssistantPrefill;
 };
 
@@ -107,6 +105,14 @@ function describeSavedGameState(savedGame: SavedGameRecord) {
   return 'Live';
 }
 
+function createTurnId() {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID();
+  }
+
+  return `turn-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 export default function App() {
   const [initialLibrary] = useState(createInitialLibrary);
   const initialActiveGame =
@@ -138,10 +144,8 @@ export default function App() {
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const activeTurnKeyRef = useRef<string | null>(null);
   const activeRequestControllerRef = useRef<AbortController | null>(null);
-  const pendingChatMessageRef = useRef<PartialChatMessage | null>(null);
-  const lastIdleResumeSignatureRef = useRef<string | null>(null);
   const currentTurnKey = createTurnKey(gameState);
-  const currentTurnPrefill =
+  const currentTurnPending =
     pendingChatMessage?.turnKey === currentTurnKey ? pendingChatMessage : null;
   const browserGames = [...savedGames].sort(
     (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
@@ -162,17 +166,15 @@ export default function App() {
     setPendingRequest(null);
     setStreamedTokenCount(0);
     setStreamConnected(false);
-    lastIdleResumeSignatureRef.current = null;
   };
 
-  const clearCurrentTurnPrefill = () => {
+  const clearCurrentTurnPending = () => {
     setPendingChatMessage((current) => current?.turnKey === currentTurnKey ? null : current);
-    lastIdleResumeSignatureRef.current = null;
   };
 
   const retryCurrentTurn = () => {
     cancelActiveRequest();
-    clearCurrentTurnPrefill();
+    clearCurrentTurnPending();
     resetTransientUi();
     setErrorMessage(null);
     setRequestEpoch((value) => value + 1);
@@ -207,10 +209,6 @@ export default function App() {
     setSavedGames((current) => [newGame, ...current]);
     hydrateSavedGame(newGame);
   };
-
-  useEffect(() => {
-    pendingChatMessageRef.current = pendingChatMessage;
-  }, [pendingChatMessage]);
 
   useEffect(() => {
     setSavedGames((current) => {
@@ -279,16 +277,10 @@ export default function App() {
       const turnState = gameState;
       const activeModel = turnState.agents[turnState.currentTeam][turnState.currentRole];
       const controller = new AbortController();
-      const savedPrefill =
-        pendingChatMessage?.turnKey === turnKey ? pendingChatMessage.prefill : undefined;
-      const assistantPrefill =
-        savedPrefill && isAssistantPrefillEnabled(activeModel) ?
-          savedPrefill
-          : undefined;
-      const resumeMode =
-        assistantPrefill ? 'prefill'
-          : savedPrefill ? 'prefill-disabled'
-            : 'fresh';
+      const savedPending =
+        pendingChatMessage?.turnKey === turnKey ? pendingChatMessage : undefined;
+      const turnId = savedPending?.turnId ?? createTurnId();
+      const resumeMode = savedPending?.turnId ? 'resume' : 'fresh';
       activeTurnKeyRef.current = requestKey;
       activeRequestControllerRef.current = controller;
       setAppState('waiting_for_response');
@@ -299,7 +291,14 @@ export default function App() {
         startedAt: Date.now(),
         resumeMode,
       });
-      setPendingChatMessage((current) => current?.turnKey === turnKey ? current : null);
+      setPendingChatMessage((current) =>
+        current?.turnKey === turnKey ?
+          {
+            ...current,
+            turnId,
+          }
+        : null,
+      );
       setErrorMessage(null);
       setIdleWarningMessage(null);
       setStreamedTokenCount(0);
@@ -311,66 +310,38 @@ export default function App() {
         role: turnState.currentRole,
         turnKey,
         resumeMode,
-        savedPrefillContentChars: savedPrefill?.content.length ?? 0,
-        savedReasoningDetails: savedPrefill?.reasoningDetails?.length ?? 0,
+        turnId,
       });
 
       void (async () => {
         try {
           let completedMove: SpymasterMove | OperativeMove | null = null;
-          const llmRequest = createLlmRequest(turnState, assistantPrefill);
-          for await (const update of streamLLMResponse(
-            llmRequest,
-            controller.signal,
-            {
-              onIdleStateChange: (message) => {
-                if (activeRequestControllerRef.current !== controller || controller.signal.aborted) {
-                  return;
-                }
+          const streamUpdates =
+            resumeMode === 'resume' ?
+              reconnectLLMResponse(turnId, controller.signal, {
+                onIdleStateChange: (message) => {
+                  if (activeRequestControllerRef.current !== controller || controller.signal.aborted) {
+                    return;
+                  }
 
-                if (!message) {
-                  setIdleWarningMessage(null);
-                  return;
-                }
+                  setIdleWarningMessage(message);
+                },
+              })
+            : streamLLMResponse(
+                createLlmRequest(turnState, turnId),
+                controller.signal,
+                {
+                  onIdleStateChange: (message) => {
+                    if (activeRequestControllerRef.current !== controller || controller.signal.aborted) {
+                      return;
+                    }
 
-                const latestPending = pendingChatMessageRef.current;
-                const savedPrefillForTurn =
-                  latestPending?.turnKey === turnKey ? latestPending.prefill : undefined;
-                const prefillSignature =
-                  savedPrefillForTurn ?
-                    `${turnKey}:${savedPrefillForTurn.content.length}:${savedPrefillForTurn.reasoning?.length ?? 0}:${savedPrefillForTurn.reasoningDetails?.length ?? 0}`
-                    : null;
+                    setIdleWarningMessage(message);
+                  },
+                },
+              );
 
-                if (
-                  isAutoResumeOnIdleEnabled(activeModel) &&
-                  isAssistantPrefillEnabled(activeModel) &&
-                  savedPrefillForTurn &&
-                  (savedPrefillForTurn.content.trim() || savedPrefillForTurn.reasoningDetails?.length) &&
-                  prefillSignature &&
-                  lastIdleResumeSignatureRef.current !== prefillSignature
-                ) {
-                  lastIdleResumeSignatureRef.current = prefillSignature;
-                  console.info('[llm] idle detected, auto-resuming from saved prefill', {
-                    modelId: activeModel.id,
-                    turnKey,
-                    prefillContentChars: savedPrefillForTurn.content.length,
-                    reasoningDetails: savedPrefillForTurn.reasoningDetails?.length ?? 0,
-                  });
-                  cancelActiveRequest();
-                  setIdleWarningMessage('No output for 15s. Resuming from saved prefill...');
-                  setPendingRequest(null);
-                  setStreamedTokenCount(0);
-                  setStreamConnected(false);
-                  setRequestEpoch((value) => value + 1);
-                  setAppState('ready_for_turn');
-                  setIsGamePaused(false);
-                  return;
-                }
-
-                setIdleWarningMessage(message);
-              },
-            },
-          )) {
+          for await (const update of streamUpdates) {
             if (activeRequestControllerRef.current !== controller || controller.signal.aborted) {
               return;
             }
@@ -385,6 +356,7 @@ export default function App() {
                       team: turnState.currentTeam,
                       role: turnState.currentRole,
                       reasoning: '',
+                      turnId,
                       prefill: { content: '' },
                     },
               );
@@ -402,6 +374,7 @@ export default function App() {
                 team: turnState.currentTeam,
                 role: turnState.currentRole,
                 reasoning: update.prefill.reasoning ?? current?.reasoning ?? '',
+                turnId,
                 prefill: update.prefill,
               }));
               continue;
@@ -413,6 +386,7 @@ export default function App() {
                 team: turnState.currentTeam,
                 role: turnState.currentRole,
                 reasoning: update.reasoning,
+                turnId,
                 prefill: {
                   content: current?.prefill.content ?? '',
                   reasoning: update.reasoning,
@@ -439,7 +413,6 @@ export default function App() {
           setIdleWarningMessage(null);
           setStreamedTokenCount(0);
           setStreamConnected(false);
-          lastIdleResumeSignatureRef.current = null;
           if (turnState.currentRole === 'spymaster') {
             setGameState(updateGameStateFromSpymasterMove(turnState, completedMove as SpymasterMove));
           } else {
@@ -457,7 +430,6 @@ export default function App() {
           setIdleWarningMessage(null);
           setStreamedTokenCount(0);
           setStreamConnected(false);
-          lastIdleResumeSignatureRef.current = null;
           setErrorMessage(
             error instanceof Error ?
               error.message
@@ -747,15 +719,11 @@ export default function App() {
               <div className='flex flex-col'>
                 <div className='flex items-center gap-2 text-amber-500'>
                   <Pause className='size-4 fill-current' />
-                  <span>{currentTurnPrefill ? 'Paused with saved state' : 'Paused'}</span>
+                  <span>{currentTurnPending ? 'Paused with resumable stream' : 'Paused'}</span>
                 </div>
-                {currentTurnPrefill && (
+                {currentTurnPending?.turnId && (
                   <span className='ml-6 mt-1 text-[10px] uppercase tracking-[0.16em] text-slate-500'>
-                    {!isAssistantPrefillEnabled(
-                      gameState.agents[currentTurnPrefill.team][currentTurnPrefill.role],
-                    ) ?
-                      'local state only'
-                      : 'saved prefill active'}
+                    turn stream available
                   </span>
                 )}
               </div>
@@ -772,7 +740,7 @@ export default function App() {
                   <Play className='size-3 fill-current' />
                   Resume
                 </button>
-                {currentTurnPrefill && (
+                {currentTurnPending && (
                   <button
                     type='button'
                     onClick={retryCurrentTurn}

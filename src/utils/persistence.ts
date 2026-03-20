@@ -34,6 +34,7 @@ export type PersistedPendingChatMessage = {
   team: TeamColor;
   role: Role;
   reasoning: string;
+  turnId?: string;
   prefill: AssistantPrefill;
 };
 
@@ -383,6 +384,9 @@ function deserializePendingChatMessage(
     team: rawPending.team,
     role: rawPending.role,
     reasoning: rawPending.reasoning,
+    ...(typeof rawPending.turnId === 'string' ?
+      { turnId: rawPending.turnId }
+      : {}),
     prefill: {
       content: rawPending.prefill.content,
       reasoning:

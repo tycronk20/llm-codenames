@@ -148,6 +148,8 @@ export const allModelCatalog = [
     modelName: 'DeepSeek V3.2 Reasoning',
     shortName: 'DeepSeek V3.2 R',
     logoKey: 'deepseek',
+    openRouterAssistantPrefillEnabled: false,
+    autoResumeOnIdle: false,
     openRouterReasoningEnabled: true,
     openRouterReasoningEffort: 'medium',
     openRouterQuantizations: ['fp8', 'fp16'],
@@ -279,4 +281,3 @@ export function hasOpenRouterReasoning(
 ) {
   return getOpenRouterReasoningEffort(model) !== undefined;
 }
-
