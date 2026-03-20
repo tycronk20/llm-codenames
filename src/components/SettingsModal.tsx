@@ -1,7 +1,11 @@
 import { Loader2, X } from 'lucide-react';
-import { useState } from 'react';
-import { allModelCatalog } from '../utils/modelCatalog';
-import { agentsById } from '../utils/models';
+import { useEffect, useState } from 'react';
+import { allModelCatalog, MIN_ACTIVE_MODELS } from '../utils/modelCatalog';
+import {
+  ACTIVE_MODEL_IDS_UPDATED_EVENT,
+  getActiveModelIds,
+  saveActiveModelIds,
+} from '../utils/models';
 
 type SettingsModalProps = {
   isOpen: boolean;
@@ -9,9 +13,30 @@ type SettingsModalProps = {
 };
 
 export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
-  const [activeModelIds, setActiveModelIds] = useState<string[]>(() => Object.keys(agentsById));
+  const [activeModelIds, setActiveModelIds] = useState<string[]>(() => getActiveModelIds());
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+
+    setActiveModelIds(getActiveModelIds());
+    setError(null);
+  }, [isOpen]);
+
+  useEffect(() => {
+    const syncActiveModelIds = (event: Event) => {
+      const detail = (event as CustomEvent<string[]>).detail;
+      setActiveModelIds(Array.isArray(detail) ? detail : getActiveModelIds());
+    };
+
+    window.addEventListener(ACTIVE_MODEL_IDS_UPDATED_EVENT, syncActiveModelIds as EventListener);
+    return () => {
+      window.removeEventListener(ACTIVE_MODEL_IDS_UPDATED_EVENT, syncActiveModelIds as EventListener);
+    };
+  }, []);
 
   if (!isOpen) return null;
 
@@ -22,27 +47,16 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   };
 
   const handleSave = async () => {
-    if (activeModelIds.length < 4) {
-      setError('At least 4 models must be active.');
+    if (activeModelIds.length < MIN_ACTIVE_MODELS) {
+      setError(`At least ${MIN_ACTIVE_MODELS} models must be active.`);
       return;
     }
 
     try {
       setIsSaving(true);
       setError(null);
-
-      const response = await fetch('/api/config/active-models', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ activeModelIds }),
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to save config.');
-      }
-
+      saveActiveModelIds(activeModelIds);
       onClose();
-      // Wait for Vite HMR to reload the page with new config
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unknown error');
     } finally {

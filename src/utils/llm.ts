@@ -1,6 +1,10 @@
 import { opSysPrompt } from '../prompts/opSysPrompt';
+import {
+  createPromptContext,
+  renderUserPrompt,
+  type GamePromptContext,
+} from '../prompts/userPrompt';
 import { spySysPrompt } from '../prompts/spySysPrompt';
-import { createUserPrompt } from '../prompts/userPrompt';
 import { GameState, OperativeMove, Role, SpymasterMove } from './game';
 import { modelCatalogById } from './modelCatalog';
 
@@ -23,16 +27,22 @@ type LLMRequest = {
   messages: Message[];
   modelId: string;
   role: Role;
+  promptContext?: GamePromptContext;
 };
 
 type LLMRequestOptions = {
   onIdleStateChange?: (message: string | null) => void;
+  /** When true, never schedule the 15s idle toast (e.g. after stream is connected). */
+  suppressIdleTimeout?: boolean;
 };
 
 const NETWORK_RETRY_DELAYS_MS = [250, 800];
 const TOKEN_IDLE_TIMEOUT_MS = 15_000;
 
 export type StreamedLLMResponse =
+  | {
+      type: 'stream_open';
+    }
   | {
       type: 'progress';
       tokenCount: number;
@@ -46,22 +56,50 @@ export type StreamedLLMResponse =
       reasoning: string;
     }
   | {
+      type: 'reasoning_phase';
+      active: boolean;
+      encrypted?: boolean;
+    }
+  | {
+      type: 'reasoning_usage';
+      reasoningTokens: number;
+    }
+  | {
       type: 'complete';
       move: SpymasterMove | OperativeMove;
     };
 
-export function createMessagesFromGameState(
+export function createLlmRequest(
   gameState: GameState,
+  assistantPrefill?: AssistantPrefill,
+): LLMRequest {
+  const promptContext = createPromptContext(gameState);
+
+  return {
+    messages: createMessagesFromPromptContext(
+      gameState.currentRole,
+      promptContext,
+      assistantPrefill,
+    ),
+    modelId: gameState.agents[gameState.currentTeam][gameState.currentRole].id,
+    role: gameState.currentRole,
+    promptContext,
+  };
+}
+
+export function createMessagesFromPromptContext(
+  role: Role,
+  promptContext: GamePromptContext,
   assistantPrefill?: AssistantPrefill,
 ): Message[] {
   const messages: Message[] = [
     {
       role: 'system',
-      content: gameState.currentRole === 'spymaster' ? spySysPrompt : opSysPrompt,
+      content: role === 'spymaster' ? spySysPrompt : opSysPrompt,
     },
     {
       role: 'user',
-      content: createUserPrompt(gameState),
+      content: renderUserPrompt(promptContext),
     },
   ];
 
@@ -90,12 +128,27 @@ export function createMessagesFromGameState(
   return messages;
 }
 
+export function createMessagesFromGameState(
+  gameState: GameState,
+  assistantPrefill?: AssistantPrefill,
+): Message[] {
+  return createMessagesFromPromptContext(
+    gameState.currentRole,
+    createPromptContext(gameState),
+    assistantPrefill,
+  );
+}
+
 export async function fetchLLMResponse(
   request: LLMRequest,
   signal?: AbortSignal,
   options: LLMRequestOptions = {},
 ): Promise<SpymasterMove | OperativeMove> {
-  const idleMonitor = createIdleMonitor(request.modelId, options.onIdleStateChange);
+  const idleMonitor = createIdleMonitor(
+    request.modelId,
+    options.onIdleStateChange,
+    () => options.suppressIdleTimeout ?? false,
+  );
 
   try {
     idleMonitor.reset();
@@ -127,7 +180,12 @@ export async function* streamLLMResponse(
   options: LLMRequestOptions = {},
 ): AsyncGenerator<StreamedLLMResponse, SpymasterMove | OperativeMove, void> {
   let emittedReasoning = false;
-  const idleMonitor = createIdleMonitor(request.modelId, options.onIdleStateChange);
+  let streamConnected = false;
+  const idleMonitor = createIdleMonitor(
+    request.modelId,
+    options.onIdleStateChange,
+    () => streamConnected,
+  );
 
   try {
     idleMonitor.reset();
@@ -149,8 +207,14 @@ export async function* streamLLMResponse(
 
     const reader = response.body?.getReader();
     if (!reader) {
-      return yield* fallbackStream(request, signal, options);
+      return yield* fallbackStream(request, signal, options, true, () => {
+        streamConnected = true;
+      });
     }
+
+    streamConnected = true;
+    idleMonitor.reset();
+    yield { type: 'stream_open' };
 
     const decoder = new TextDecoder();
     let buffer = '';
@@ -178,10 +242,31 @@ export async function* streamLLMResponse(
           continue;
         }
 
-        if (event.type === 'progress' && typeof event.tokenCount === 'number') {
+        if (event.type === 'stream_open') {
+          streamConnected = true;
+          idleMonitor.reset();
+          yield { type: 'stream_open' };
+        } else if (event.type === 'progress' && typeof event.tokenCount === 'number') {
+          idleMonitor.reset();
           yield {
             type: 'progress',
             tokenCount: event.tokenCount,
+          };
+        } else if (event.type === 'reasoning_phase' && typeof event.active === 'boolean') {
+          idleMonitor.reset();
+          yield {
+            type: 'reasoning_phase',
+            active: event.active,
+            ...(typeof event.encrypted === 'boolean' ? { encrypted: event.encrypted } : {}),
+          };
+        } else if (
+          event.type === 'reasoning_usage' &&
+          typeof event.reasoningTokens === 'number'
+        ) {
+          idleMonitor.reset();
+          yield {
+            type: 'reasoning_usage',
+            reasoningTokens: event.reasoningTokens,
           };
         } else if (
           event.type === 'prefill' &&
@@ -189,6 +274,7 @@ export async function* streamLLMResponse(
           typeof event.prefill === 'object' &&
           typeof (event.prefill as Record<string, unknown>).content === 'string'
         ) {
+          idleMonitor.reset();
           const prefill = event.prefill as Record<string, unknown>;
           yield {
             type: 'prefill',
@@ -203,12 +289,14 @@ export async function* streamLLMResponse(
             },
           };
         } else if (event.type === 'reasoning' && typeof event.reasoning === 'string') {
+          idleMonitor.reset();
           emittedReasoning = true;
           yield {
             type: 'reasoning',
             reasoning: event.reasoning,
           };
         } else if (event.type === 'complete' && event.move && typeof event.move === 'object') {
+          idleMonitor.reset();
           completedMove = event.move as SpymasterMove | OperativeMove;
           yield {
             type: 'complete',
@@ -221,7 +309,9 @@ export async function* streamLLMResponse(
     }
 
     if (!completedMove) {
-      return yield* fallbackStream(request, signal, options, !emittedReasoning);
+      return yield* fallbackStream(request, signal, options, !emittedReasoning, () => {
+        streamConnected = true;
+      });
     }
 
     return completedMove;
@@ -230,7 +320,9 @@ export async function* streamLLMResponse(
       throw error;
     }
 
-    return yield* fallbackStream(request, signal, options, !emittedReasoning);
+    return yield* fallbackStream(request, signal, options, !emittedReasoning, () => {
+      streamConnected = true;
+    });
   } finally {
     idleMonitor.dispose();
   }
@@ -254,8 +346,14 @@ async function* fallbackStream(
   signal?: AbortSignal,
   options: LLMRequestOptions = {},
   emitReasoning = true,
+  onStreamConnected?: () => void,
 ): AsyncGenerator<StreamedLLMResponse, SpymasterMove | OperativeMove, void> {
-  const move = await fetchLLMResponse(request, signal, options);
+  onStreamConnected?.();
+  yield { type: 'stream_open' };
+  const move = await fetchLLMResponse(request, signal, {
+    ...options,
+    suppressIdleTimeout: true,
+  });
   if (emitReasoning) {
     yield {
       type: 'reasoning',
@@ -280,6 +378,7 @@ function safeJsonParse(text: string) {
 function createIdleMonitor(
   modelId: string,
   onIdleStateChange?: (message: string | null) => void,
+  shouldSuppressIdle?: () => boolean,
 ) {
   const modelLabel = getModelLabel(modelId);
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -301,6 +400,9 @@ function createIdleMonitor(
       }
 
       clearIdleState();
+      if (shouldSuppressIdle?.()) {
+        return;
+      }
       timeoutId = setTimeout(() => {
         isIdle = true;
         onIdleStateChange?.(

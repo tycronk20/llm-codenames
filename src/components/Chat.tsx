@@ -1,17 +1,11 @@
 import { Loader2 } from 'lucide-react';
 import { colorizeMessage } from '../utils/colors';
-import { CardType, TeamColor } from '../utils/game';
-import { LLMModel } from '../utils/models';
-
-export type ChatMessage = {
-  model: LLMModel;
-  message: string;
-  team: TeamColor;
-  cards?: CardType[];
-  isStreaming?: boolean;
-};
+import { ChatMessage } from '../utils/game';
 
 export function Chat({ message, team, model, cards, isStreaming = false }: ChatMessage) {
+  const body = cards ? colorizeMessage(message, cards) : message;
+  const showBodyPlaceholder = isStreaming && !message.trim();
+
   return (
     <div className='flex flex-col p-3'>
       {/* Model chat heading */}
@@ -33,10 +27,7 @@ export function Chat({ message, team, model, cards, isStreaming = false }: ChatM
           {model.shortName}
         </span>
         {isStreaming && (
-          <span className='inline-flex items-center gap-1 rounded-full border border-slate-500/40 bg-slate-900/80 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] text-slate-300'>
-            <Loader2 className='size-3 animate-spin' />
-            CoT
-          </span>
+          <Loader2 className='size-3.5 shrink-0 animate-spin text-slate-400' aria-hidden />
         )}
       </div>
 
@@ -47,9 +38,9 @@ export function Chat({ message, team, model, cards, isStreaming = false }: ChatM
           className={`mt-2 whitespace-pre-line border-l-4 pl-3 text-sm italic ${
             isStreaming ? 'opacity-90' : ''
           } text-slate-300 ${team === 'blue' ? 'border-sky-600/90' : 'border-rose-600/90'
-          }`}
+          } ${showBodyPlaceholder ? 'min-h-[2.5rem]' : ''}`}
         >
-          {cards ? colorizeMessage(message, cards) : message}
+          {showBodyPlaceholder ? '\u00a0' : body}
         </p>
       </div>
     </div>

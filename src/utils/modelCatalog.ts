@@ -1,6 +1,18 @@
-export type Provider = 'google' | 'openai' | 'anthropic' | 'openrouter';
+export type Provider = 'google' | 'openai' | 'anthropic' | 'openrouter' | 'xai';
 
 export type LogoKey = 'anthropic' | 'deepseek' | 'gemini' | 'openai' | 'openrouter' | 'xai';
+
+/** OpenRouter `provider.quantizations` routing filter (matches OpenRouter API). */
+export type OpenRouterQuantization =
+  | 'int4'
+  | 'int8'
+  | 'fp4'
+  | 'fp6'
+  | 'fp8'
+  | 'fp16'
+  | 'bf16'
+  | 'fp32'
+  | 'unknown';
 
 export type LLMModelConfig = {
   id: string;
@@ -16,12 +28,16 @@ export type LLMModelConfig = {
   openRouterReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'none';
   openAiReasoningEffort?: 'medium' | 'high' | 'xhigh';
   openRouterReasoningEnabled?: boolean;
+  /** When set, only OpenRouter endpoints matching these quantization levels are eligible. */
+  openRouterQuantizations?: readonly OpenRouterQuantization[];
   anthropicThinking?: {
     type: 'adaptive';
     display?: 'summarized' | 'omitted';
     effort?: 'low' | 'medium' | 'high' | 'max';
   };
 };
+
+export const MIN_ACTIVE_MODELS = 4;
 
 export const allModelCatalog = [
   {
@@ -134,6 +150,7 @@ export const allModelCatalog = [
     logoKey: 'deepseek',
     openRouterReasoningEnabled: true,
     openRouterReasoningEffort: 'medium',
+    openRouterQuantizations: ['fp8', 'fp16'],
   },
   {
     id: 'deepseek-v3.2',
@@ -144,16 +161,16 @@ export const allModelCatalog = [
     logoKey: 'deepseek',
     openRouterReasoningEnabled: false,
     openRouterReasoningEffort: 'none',
+    openRouterQuantizations: ['fp8', 'fp16'],
   },
   {
     id: 'grok-4.1-fast',
-    provider: 'openrouter',
-    apiModel: 'x-ai/grok-4.1-fast',
+    provider: 'xai',
+    apiModel: 'grok-4-1-fast-reasoning',
     modelName: 'Grok 4.1 Fast',
     shortName: 'Grok 4.1 Fast',
     logoKey: 'xai',
     autoResumeOnIdle: false,
-    openRouterReasoningEnabled: true,
   },
   {
     id: 'gpt-oss-120b-high',
@@ -184,12 +201,11 @@ export const allModelCatalog = [
   },
   {
     id: 'grok-4.20-beta',
-    provider: 'openrouter',
-    apiModel: 'x-ai/grok-4.20-beta',
+    provider: 'xai',
+    apiModel: 'grok-4.20-0309-reasoning',
     modelName: 'Grok 4.20 Beta',
     shortName: 'Grok 4.20',
     logoKey: 'xai',
-    openRouterReasoningEnabled: true,
   },
   {
     id: 'glm-5',
@@ -212,7 +228,7 @@ export const allModelCatalog = [
     openAiReasoningEffort: 'medium',
     openRouterReasoningEnabled: true,
   },
- ] as const satisfies readonly LLMModelConfig[];
+] as const satisfies readonly LLMModelConfig[];
 
 type ModelId = (typeof allModelCatalog)[number]['id'];
 
@@ -237,3 +253,30 @@ export const modelCatalog: LLMModelConfig[] = activeModelIds.map((modelId) => {
 });
 
 export const modelCatalogById: Record<string, LLMModelConfig> = allModelCatalogById;
+
+export function isAssistantPrefillEnabled(
+  model: Pick<LLMModelConfig, 'openRouterAssistantPrefillEnabled'>,
+) {
+  return model.openRouterAssistantPrefillEnabled !== false;
+}
+
+export function isAutoResumeOnIdleEnabled(model: Pick<LLMModelConfig, 'autoResumeOnIdle'>) {
+  return model.autoResumeOnIdle !== false;
+}
+
+export function getOpenRouterReasoningEffort(
+  model: Pick<LLMModelConfig, 'openRouterReasoningEffort' | 'openRouterReasoningEnabled'>,
+) {
+  if (model.openRouterReasoningEffort) {
+    return model.openRouterReasoningEffort;
+  }
+
+  return model.openRouterReasoningEnabled ? 'medium' : undefined;
+}
+
+export function hasOpenRouterReasoning(
+  model: Pick<LLMModelConfig, 'openRouterReasoningEffort' | 'openRouterReasoningEnabled'>,
+) {
+  return getOpenRouterReasoningEffort(model) !== undefined;
+}
+

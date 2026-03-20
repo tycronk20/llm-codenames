@@ -1,6 +1,41 @@
+import { execSync } from 'child_process';
 import react from '@vitejs/plugin-react-swc';
-import type { PreviewServer, ViteDevServer } from 'vite';
+import type { Plugin, PreviewServer, ViteDevServer } from 'vite';
 import { defineConfig, loadEnv } from 'vite';
+
+const DEFAULT_PORT = 5173;
+
+function isPortInUse(port: number): boolean {
+  try {
+    execSync(`lsof -i :${port} -sTCP:LISTEN`, { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function findFreePort(startPort: number): number {
+  let port = startPort;
+  while (isPortInUse(port)) {
+    port++;
+  }
+  return port;
+}
+
+function portGuardPlugin(defaultPort: number): Plugin {
+  return {
+    name: 'port-guard',
+    config() {
+      const port = findFreePort(defaultPort);
+      if (port !== defaultPort) {
+        console.warn(
+          `\n  Port ${defaultPort} is in use (another worktree?). Using port ${port} instead.\n`,
+        );
+        return { server: { port, strictPort: true }, preview: { port, strictPort: true } };
+      }
+    },
+  };
+}
 
 export default defineConfig(async ({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
@@ -8,7 +43,16 @@ export default defineConfig(async ({ mode }) => {
   const llmApiMiddleware = createLlmApiMiddleware(env);
 
   return {
+    server: {
+      port: DEFAULT_PORT,
+      strictPort: true,
+    },
+    preview: {
+      port: DEFAULT_PORT,
+      strictPort: true,
+    },
     plugins: [
+      portGuardPlugin(DEFAULT_PORT),
       react(),
       {
         name: 'llm-api',

@@ -1,7 +1,7 @@
-import { ChatMessage } from '../components/Chat';
+import { ChatMessage } from './game';
 import { AssistantPrefill } from './llm';
 import { CardType, GameState, Role, TeamColor, initializeGameState } from './game';
-import { agentsById, LLMModel } from './models';
+import { getActiveModels, LLMModel, resolveModel } from './models';
 
 type PersistedViewState =
   | 'game_start'
@@ -150,7 +150,7 @@ export function createSavedGame(options: {
     title: options.title ?? 'Game',
     createdAt: options.createdAt ?? timestamp,
     updatedAt: options.updatedAt ?? timestamp,
-    gameState: options.gameState ?? initializeGameState(),
+    gameState: options.gameState ?? initializeGameState(getActiveModels()),
     appState: options.appState ?? 'game_start',
     isGamePaused: options.isGamePaused ?? true,
     errorMessage: options.errorMessage ?? null,
@@ -314,10 +314,10 @@ function normalizeViewState(
 }
 
 function deserializeGameState(rawState: PersistedGameState): GameState | null {
-  const redSpymaster = resolveModel(rawState.agents?.red?.spymaster?.id);
-  const redOperative = resolveModel(rawState.agents?.red?.operative?.id);
-  const blueSpymaster = resolveModel(rawState.agents?.blue?.spymaster?.id);
-  const blueOperative = resolveModel(rawState.agents?.blue?.operative?.id);
+  const redSpymaster = resolvePersistedModel(rawState.agents?.red?.spymaster?.id);
+  const redOperative = resolvePersistedModel(rawState.agents?.red?.operative?.id);
+  const blueSpymaster = resolvePersistedModel(rawState.agents?.blue?.spymaster?.id);
+  const blueOperative = resolvePersistedModel(rawState.agents?.blue?.operative?.id);
 
   if (!redSpymaster || !redOperative || !blueSpymaster || !blueOperative) {
     return null;
@@ -347,7 +347,7 @@ function deserializeGameState(rawState: PersistedGameState): GameState | null {
 }
 
 function deserializeChatMessage(rawMessage: PersistedChatMessage): ChatMessage | null {
-  const model = resolveModel(rawMessage.model?.id);
+  const model = resolvePersistedModel(rawMessage.model?.id);
   if (!model || typeof rawMessage.message !== 'string') {
     return null;
   }
@@ -404,12 +404,8 @@ function sanitizeCard(card: CardType): CardType {
   };
 }
 
-function resolveModel(modelId: string | undefined): LLMModel | null {
-  if (!modelId) {
-    return null;
-  }
-
-  return agentsById[modelId] ?? null;
+function resolvePersistedModel(modelId: string | undefined): LLMModel | null {
+  return resolveModel(modelId);
 }
 
 function createSavedGameId() {

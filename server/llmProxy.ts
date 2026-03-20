@@ -1,10 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { appendFile, mkdir, writeFile } from 'node:fs/promises';
 import { IncomingMessage, ServerResponse } from 'node:http';
+import { createXai } from '@ai-sdk/xai';
+import { generateText, streamText } from 'ai';
 import { OpenRouter } from '@openrouter/sdk';
 import { createRequire } from 'node:module';
 import { jsonrepair } from 'jsonrepair';
-import { modelCatalogById, type Provider } from '../src/utils/modelCatalog.ts';
+import { modelCatalogById, type Provider, getOpenRouterReasoningEffort } from '../src/utils/modelCatalog.ts';
+import { parsePromptContext, type GamePromptContext } from '../src/prompts/userPrompt.ts';
 
 type Message = {
   role: 'system' | 'user' | 'assistant';
@@ -19,6 +22,7 @@ type LlmApiRequest = {
   modelId: string;
   messages: Message[];
   role: MoveRole;
+  promptContext?: GamePromptContext;
 };
 
 type JsonObject = Record<string, unknown>;
@@ -123,11 +127,12 @@ const moveSchemas: Record<MoveRole, JsonObject> = {
   },
 };
 
-const PROVIDER_TIMEOUT_MS: Record<'anthropic' | 'google' | 'openai' | 'openrouter', number> = {
+const PROVIDER_TIMEOUT_MS: Record<'anthropic' | 'google' | 'openai' | 'openrouter' | 'xai', number> = {
   anthropic: 90_000,
   google: 75_000,
   openai: 90_000,
   openrouter: 90_000,
+  xai: 90_000,
 };
 const REASONING_TIMEOUT_MS: Record<'medium' | 'high' | 'xhigh', number> = {
   medium: 90_000,
@@ -156,6 +161,7 @@ const streamProviderHandlers: Partial<Record<Provider, StreamProviderHandler>> =
   google: streamGoogleModel,
   openai: streamOpenAiModel,
   openrouter: streamOpenRouterModel,
+  xai: streamXaiModel,
 };
 
 export function createLlmApiMiddleware(env: Record<string, string>) {
@@ -184,7 +190,7 @@ export function createLlmApiMiddleware(env: Record<string, string>) {
           role: request.role,
           stream: true,
           timeoutMs,
-          ...summarizeMessages(request.messages),
+          ...summarizeRequest(request),
         });
 
         await streamStructuredMove(request, env, res, requestId);
@@ -214,7 +220,7 @@ export function createLlmApiMiddleware(env: Record<string, string>) {
             request?.modelId,
             request ? getProviderTimeoutMs(request.modelId) : undefined,
           ),
-          ...(request ? summarizeMessages(request.messages) : {}),
+          ...(request ? summarizeRequest(request) : {}),
         });
         if (!res.headersSent) {
           writeJson(res, isTimeoutError(error) ? 504 : 500, {
@@ -290,7 +296,7 @@ export function createLlmApiMiddleware(env: Record<string, string>) {
         role: request.role,
         stream: false,
         timeoutMs,
-        ...summarizeMessages(request.messages),
+        ...summarizeRequest(request),
       });
 
       const result = await fetchStructuredMove(request, env, requestId);
@@ -330,7 +336,7 @@ export function createLlmApiMiddleware(env: Record<string, string>) {
         durationMs,
         timeoutMs,
         error: errorMessage,
-        ...(request ? summarizeMessages(request.messages) : {}),
+        ...(request ? summarizeRequest(request) : {}),
       });
       writeJson(res, statusCode, {
         error: errorMessage,
@@ -393,7 +399,8 @@ async function fetchStructuredMove(
       model.provider === 'openai' ? await callOpenAiModel(request, env)
         : model.provider === 'anthropic' ? await callAnthropicModel(request, env)
           : model.provider === 'google' ? await callGoogleModel(request, env)
-            : await callOpenRouterModel(request, env, requestId);
+            : model.provider === 'xai' ? await callXaiModel(request, env, requestId)
+              : await callOpenRouterModel(request, env, requestId);
 
     if (requestId) {
       await writeRunLog({
@@ -492,6 +499,7 @@ async function streamResolvedMove(
 
   if (!res.headersSent) {
     openNdjsonStream(res);
+    writeStreamOpenEvent(res);
   }
 
   if (requestId && originalError) {
@@ -566,6 +574,24 @@ async function callGoogleModel(request: LlmApiRequest, env: Record<string, strin
   return parseGoogleGenerateContentPayload(response);
 }
 
+async function callXaiModel(
+  request: LlmApiRequest,
+  env: Record<string, string>,
+  requestId?: string,
+) {
+  const response = await generateText({
+    ...createXaiTextParams(request, env),
+    abortSignal: AbortSignal.timeout(getProviderTimeoutMs(request.modelId)),
+  });
+
+  return resolveMoveWithFormatRepair(request, env, {
+    requestId,
+    source: 'xai_nonstream',
+    output: response.text,
+    reasoning: response.reasoningText?.trim(),
+  });
+}
+
 async function callOpenRouterModel(
   request: LlmApiRequest,
   env: Record<string, string>,
@@ -612,6 +638,7 @@ async function streamOpenAiModel(
     timeout: timeoutMs,
   });
   openNdjsonStream(res);
+  writeStreamOpenEvent(res);
   const lastMessage = request.messages[request.messages.length - 1];
   const isPrefill = lastMessage?.role === 'assistant';
   let reasoningText = isPrefill ? lastMessage.reasoning || '' : '';
@@ -723,6 +750,7 @@ async function streamAnthropicModel(
   }
 
   openNdjsonStream(res);
+  writeStreamOpenEvent(res);
   const lastMessage = request.messages[request.messages.length - 1];
   const isPrefill = lastMessage?.role === 'assistant';
   let reasoningText = isPrefill ? lastMessage.reasoning || '' : '';
@@ -917,7 +945,7 @@ async function streamAnthropicModel(
       finishedAt: new Date().toISOString(),
       status: 'succeeded',
       stopReason: stopReason || undefined,
-      messageSummary: summarizeMessages(request.messages),
+      messageSummary: summarizeRequest(request),
       reasoningText,
       assistantText,
       streamedToolInput,
@@ -952,7 +980,7 @@ async function streamAnthropicModel(
       status: 'failed',
       stopReason: stopReason || undefined,
       error: getClientErrorMessage(error, request.modelId, timeoutMs),
-      messageSummary: summarizeMessages(request.messages),
+      messageSummary: summarizeRequest(request),
       reasoningText,
       assistantText,
       streamedToolInput,
@@ -1032,6 +1060,7 @@ async function streamGoogleModel(
     createGoogleGenerateContentParams(request, { includeThoughts: true }),
   );
   openNdjsonStream(res);
+  writeStreamOpenEvent(res);
   const lastMessage = request.messages[request.messages.length - 1];
   const isPrefill = lastMessage?.role === 'assistant';
   let reasoningText = isPrefill ? lastMessage.reasoning || '' : '';
@@ -1119,6 +1148,174 @@ async function streamGoogleModel(
   }
 }
 
+function hasXaiEncryptedReasoningMetadata(part: { providerMetadata?: unknown }) {
+  const meta = part.providerMetadata;
+  if (!meta || typeof meta !== 'object') {
+    return false;
+  }
+
+  const xai = (meta as Record<string, unknown>).xai;
+  if (!xai || typeof xai !== 'object') {
+    return false;
+  }
+
+  const encrypted = (xai as Record<string, unknown>).reasoningEncryptedContent;
+  return typeof encrypted === 'string' ? encrypted.length > 0 : encrypted != null;
+}
+
+async function streamXaiModel(
+  request: LlmApiRequest,
+  env: Record<string, string>,
+  res: ServerResponse<IncomingMessage>,
+  requestId?: string,
+) {
+  const model = modelCatalogById[request.modelId];
+  const timeoutMs = getProviderTimeoutMs(request.modelId);
+  const startedAt = Date.now();
+  if (requestId) {
+    await writeRunLog({
+      requestId,
+      event: 'provider_started',
+      modelId: request.modelId,
+      provider: model?.provider,
+      role: request.role,
+      stream: true,
+      timeoutMs,
+    });
+  }
+
+  const lastMessage = request.messages[request.messages.length - 1];
+  const isPrefill = lastMessage?.role === 'assistant';
+  let reasoningText = isPrefill ? lastMessage.reasoning || '' : '';
+  let outputText = isPrefill ? lastMessage.content || '' : '';
+  let streamedText = isPrefill ? `${lastMessage.reasoning || ''}${lastMessage.content || ''}` : '';
+  let sseEventCount = 0;
+
+  const result = streamText({
+    ...createXaiTextParams(request, env),
+    abortSignal: AbortSignal.timeout(timeoutMs),
+  });
+
+  openNdjsonStream(res);
+  writeStreamOpenEvent(res);
+
+  try {
+    for await (const part of result.fullStream) {
+      sseEventCount++;
+
+      if (part.type === 'reasoning-start') {
+        writeNdjsonEvent(res, {
+          type: 'reasoning_phase',
+          active: true,
+        });
+        continue;
+      }
+
+      if (part.type === 'reasoning-end') {
+        writeNdjsonEvent(res, {
+          type: 'reasoning_phase',
+          active: false,
+          encrypted: hasXaiEncryptedReasoningMetadata(part),
+        });
+        continue;
+      }
+
+      if (part.type === 'finish-step') {
+        const rt = part.usage?.outputTokenDetails?.reasoningTokens;
+        if (typeof rt === 'number' && rt > 0) {
+          writeNdjsonEvent(res, {
+            type: 'reasoning_usage',
+            reasoningTokens: rt,
+          });
+        }
+        continue;
+      }
+
+      if (part.type === 'reasoning-delta') {
+        const delta = part.text || '';
+        if (!delta) {
+          continue;
+        }
+
+        reasoningText += delta;
+        streamedText += delta;
+        writeProgressEvent(res, streamedText);
+        writeNdjsonEvent(res, {
+          type: 'reasoning',
+          reasoning: reasoningText.trimEnd(),
+        });
+        continue;
+      }
+
+      if (part.type === 'text-delta') {
+        const delta = part.text || '';
+        if (!delta) {
+          continue;
+        }
+
+        outputText += delta;
+        streamedText += delta;
+        writeProgressEvent(res, streamedText);
+      }
+    }
+
+    const finalReasoning = (await result.reasoningText)?.trim() || reasoningText.trim();
+    const finalText = (await result.text) || outputText;
+    const move = await resolveMoveWithFormatRepair(request, env, {
+      requestId,
+      source: 'xai_stream',
+      output: finalText,
+      reasoning: finalReasoning,
+    });
+
+    if (requestId) {
+      await writeRunLog({
+        requestId,
+        event: 'provider_succeeded',
+        modelId: request.modelId,
+        provider: model?.provider,
+        role: request.role,
+        stream: true,
+        durationMs: Date.now() - startedAt,
+        timeoutMs,
+        sseEventCount,
+        reasoningChars: finalReasoning.length,
+        outputChars: finalText.length,
+        ...summarizeMove(move),
+      });
+    }
+
+    writeNdjsonEvent(res, {
+      type: 'reasoning',
+      reasoning: finalReasoning || move.reasoning,
+    });
+    writeNdjsonEvent(res, {
+      type: 'complete',
+      move,
+    });
+    res.end();
+  } catch (error) {
+    if (requestId) {
+      await writeRunLog({
+        requestId,
+        event: 'provider_failed',
+        modelId: request.modelId,
+        provider: model?.provider,
+        role: request.role,
+        stream: true,
+        durationMs: Date.now() - startedAt,
+        timeoutMs,
+        sseEventCount,
+        reasoningChars: reasoningText.length,
+        outputChars: outputText.length,
+        error: getClientErrorMessage(error, request.modelId, timeoutMs),
+      });
+    }
+
+    throw error;
+  }
+}
+
 async function streamOpenRouterModel(
   request: LlmApiRequest,
   env: Record<string, string>,
@@ -1169,6 +1366,7 @@ async function streamOpenRouterModel(
     if (!isAsyncIterable(streamOrResponse)) {
       const move = await resolveOpenRouterMove(request, env, streamOrResponse, requestId);
       openNdjsonStream(res);
+      writeStreamOpenEvent(res);
       writeNdjsonEvent(res, {
         type: 'reasoning',
         reasoning: move.reasoning,
@@ -1198,6 +1396,7 @@ async function streamOpenRouterModel(
     }
 
     openNdjsonStream(res);
+    writeStreamOpenEvent(res);
 
     for await (const chunk of streamOrResponse) {
       inactivityTimeout.reset();
@@ -1565,6 +1764,28 @@ function createGoogleGenerateContentParams(
   };
 }
 
+function createXaiTextParams(request: LlmApiRequest, env: Record<string, string>) {
+  const model = modelCatalogById[request.modelId];
+  const apiKey = pickEnvValue(env, ['XAI_KEY'], /^XAI(_.+)?$/);
+  if (!apiKey) {
+    throw new Error('Missing xAI API key. Set XAI_KEY.');
+  }
+
+  const provider = createXai({ apiKey });
+  const { system, messages } = splitSystemMessage(request.messages);
+
+  return {
+    model: provider.responses(model.apiModel),
+    ...(system ? { system } : {}),
+    messages,
+    providerOptions: {
+      xai: {
+        store: false,
+      },
+    },
+  };
+}
+
 function createOpenRouterClient(modelId: string, env: Record<string, string>) {
   const apiKey = pickEnvValue(env, ['OPENROUTER_API_KEY'], /^OPENROUTER_API_KEY(_.+)?$/);
   if (!apiKey) {
@@ -1587,45 +1808,39 @@ function createOpenRouterChatParams(
 ) {
   const model = modelCatalogById[request.modelId];
   const stream = options?.stream ?? false;
-  const reasoningConfig: {
-    effort?: NonNullable<(typeof modelCatalogById)[string]['openRouterReasoningEffort']>;
-  } = {};
-
-  if (model.openRouterReasoningEffort) {
-    reasoningConfig.effort = model.openRouterReasoningEffort;
-  } else if (model.openRouterReasoningEnabled) {
-    reasoningConfig.effort = 'medium';
-  }
+  const reasoningEffort = getOpenRouterReasoningEffort(model);
 
   return {
     model: model.apiModel,
     maxTokens: 4096,
-    messages:
-      request.messages.map((message) =>
-        message.role === 'assistant' ?
-          {
-            role: 'assistant' as const,
-            content: message.content,
-            ...(message.reasoningDetails?.length ?
-              {
-                reasoningDetails: message.reasoningDetails,
-              }
-              : {}),
-          }
-          : {
-            role: message.role,
-            content: message.content,
-          },
-      ) as unknown as import('@openrouter/sdk/models').Message[],
+    messages: request.messages.map((message) =>
+      message.role === 'assistant' ?
+        {
+          role: 'assistant' as const,
+          content: message.content,
+          ...(message.reasoningDetails?.length ?
+            {
+              reasoningDetails: message.reasoningDetails,
+            }
+            : {}),
+        }
+      : {
+          role: message.role,
+          content: message.content,
+        },
+    ),
     provider: {
       allowFallbacks: true,
+      ...(model.openRouterQuantizations?.length ?
+        { quantizations: [...model.openRouterQuantizations] }
+        : {}),
     },
     responseFormat: {
       type: 'json_object' as const,
     },
     ...(stream ? { stream: true } : {}),
     ...(!stream ? { plugins: [{ id: 'response-healing' as const }] } : {}),
-    ...(Object.keys(reasoningConfig).length > 0 ? { reasoning: reasoningConfig } : {}),
+    ...(reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
   };
 }
 
@@ -2247,6 +2462,7 @@ function parseRequest(payload: unknown): LlmApiRequest {
     role,
     modelId,
     messages: messages.map((message) => parseMessage(message)),
+    promptContext: parsePromptContext(request.promptContext),
   };
 }
 
@@ -2350,6 +2566,10 @@ function openNdjsonStream(res: ServerResponse<IncomingMessage>) {
   res.setHeader('Connection', 'keep-alive');
 }
 
+function writeStreamOpenEvent(res: ServerResponse<IncomingMessage>) {
+  writeNdjsonEvent(res, { type: 'stream_open' });
+}
+
 function writeNdjsonEvent(res: ServerResponse<IncomingMessage>, event: unknown) {
   res.write(`${JSON.stringify(event)}\n`);
 }
@@ -2439,8 +2659,12 @@ function getClientErrorMessage(error: unknown, modelId?: string, timeoutMs?: num
   return error instanceof Error ? error.message : 'Unknown LLM proxy error';
 }
 
-function summarizeMessages(messages: Message[]) {
-  const gameSnapshot = extractGameSnapshot(messages);
+function summarizeRequest(request: LlmApiRequest) {
+  return summarizeMessages(request.messages, request.promptContext);
+}
+
+function summarizeMessages(messages: Message[], promptContext?: GamePromptContext) {
+  const gameSnapshot = extractGameSnapshot(messages, promptContext);
   const summary = {
     messageCount: messages.length,
     messageChars: 0,
@@ -2466,7 +2690,33 @@ function summarizeMessages(messages: Message[]) {
   return summary;
 }
 
-function extractGameSnapshot(messages: Message[]) {
+function extractGameSnapshot(messages: Message[], promptContext?: GamePromptContext) {
+  if (promptContext) {
+    const board = promptContext.board.map((card) => ({
+      word: card.word,
+      ...(card.color ? { color: card.color } : {}),
+      isRevealed: card.isRevealed,
+      ...(card.wasRecentlyRevealed ? { wasRecentlyRevealed: true } : {}),
+    }));
+
+    return {
+      currentTeam: promptContext.currentTeam,
+      currentRole: promptContext.currentRole,
+      remainingRed: promptContext.remainingRed,
+      remainingBlue: promptContext.remainingBlue,
+      ...(promptContext.clue ?
+        {
+          clueText: promptContext.clue.text,
+          clueNumber: promptContext.clue.number,
+        }
+        : {}),
+      board,
+      cardCount: board.length,
+      revealedCount: board.filter((card) => card.isRevealed).length,
+      recentlyRevealedCount: board.filter((card) => card.wasRecentlyRevealed).length,
+    };
+  }
+
   const userMessage = messages.find((message) => message.role === 'user')?.content;
   if (!userMessage) {
     return undefined;

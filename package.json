@@ -10,15 +10,18 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@ai-sdk/xai": "^3.0.67",
     "@anthropic-ai/sdk": "0.79.0",
     "@google/genai": "1.45.0",
     "@openrouter/sdk": "^0.9.11",
+    "ai": "^6.0.116",
     "dotenv": "^16.4.5",
     "jsonrepair": "^3.11.0",
     "lucide-react": "^0.456.0",
     "openai": "6.31.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@eslint/js": "^9.15.0",

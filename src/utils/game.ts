@@ -1,6 +1,6 @@
 import wordlist from '../assets/wordlist-eng.txt?raw';
-import { ChatMessage } from '../components/Chat';
-import { agents, LLMModel } from './models';
+import { LLMModel } from './models';
+import { MIN_ACTIVE_MODELS } from './modelCatalog';
 // Core types
 export type TeamColor = 'red' | 'blue';
 export type CardColor = 'red' | 'blue' | 'black' | 'neutral';
@@ -39,7 +39,14 @@ export function formatMoveMessage(
   return `${operativeMove.reasoning}\n\nGuesses: ${operativeMove.guesses.join(', ')}`;
 }
 
-// Nested object type for team agents to track which LLM model is being used for each role
+export type ChatMessage = {
+  model: LLMModel;
+  message: string;
+  team: TeamColor;
+  cards?: CardType[];
+  isStreaming?: boolean;
+};
+
 export type TeamAgents = {
   [key in Role]: LLMModel;
 };
@@ -68,20 +75,20 @@ export type GameState = {
 };
 
 // Initialize new game state
-export const initializeGameState = (): GameState => {
+export function initializeGameState(activeModels: LLMModel[] = []): GameState {
   return {
     cards: drawNewCards(),
-    agents: selectRandomAgents(),
+    agents: selectRandomAgents(activeModels),
     currentTeam: 'red',
     currentRole: 'spymaster',
     remainingRed: 9,
     remainingBlue: 8,
     chatHistory: [],
   };
-};
+}
 
 const drawNewCards = (): CardType[] => {
-  const allWords = wordlist.split('\n').filter((word) => word.trim() !== '');
+  const allWords = wordlist.split('\n').filter((word: string) => word.trim() !== '');
   const gameCards: CardType[] = [];
 
   // Randomly select 25 words
@@ -117,12 +124,11 @@ const drawNewCards = (): CardType[] => {
 };
 
 // Select four random agents to form the two teams
-// More agents can be added by editing the `agents` array in `constants/models.ts`
-const selectRandomAgents = (): GameAgents => {
-  const availableAgents = [...agents];
-  if (availableAgents.length < 4) {
+const selectRandomAgents = (activeModels: LLMModel[] = []): GameAgents => {
+  const availableAgents = [...activeModels];
+  if (availableAgents.length < MIN_ACTIVE_MODELS) {
     throw new Error(
-      'At least 4 active models are required. Update activeModelIds in src/utils/modelCatalog.ts.',
+      `At least ${MIN_ACTIVE_MODELS} active models are required. Update your active model settings.`,
     );
   }
 
@@ -149,6 +155,23 @@ const resetAnimations = (cards: CardType[]) => {
   });
 };
 
+/** Trim and strip outer punctuation so model output still matches board words. */
+function normalizeGuessToken(value: string): string {
+  return value
+    .trim()
+    .normalize('NFKC')
+    .replace(/^[\s"'`.,;:!?]+|[\s"'`.,;:!?]+$/g, '');
+}
+
+function findCardForGuess(cards: CardType[], guess: string): CardType | undefined {
+  const g = normalizeGuessToken(guess).toUpperCase();
+  if (!g) {
+    return undefined;
+  }
+
+  return cards.find((c) => normalizeGuessToken(c.word).toUpperCase() === g);
+}
+
 // Set the guess properties and switch to operative role
 export function updateGameStateFromSpymasterMove(
   currentState: GameState,
@@ -172,32 +195,43 @@ export function updateGameStateFromSpymasterMove(
   return newState;
 }
 
+function appendOperativeChatMessage(
+  newState: GameState,
+  snapshotState: GameState,
+  move: OperativeMove,
+  appliedGuesses: string[],
+) {
+  newState.currentGuesses = appliedGuesses;
+  newState.chatHistory.push({
+    message: formatMoveMessage('operative', { ...move, guesses: appliedGuesses }),
+    model: snapshotState.agents[snapshotState.currentTeam].operative,
+    team: snapshotState.currentTeam,
+    cards: newState.cards,
+  });
+}
+
 // Make guesses and switch to spymaster role
 export function updateGameStateFromOperativeMove(
   currentState: GameState,
   move: OperativeMove,
 ): GameState {
   const newState = { ...currentState };
-  newState.chatHistory.push({
-    message: formatMoveMessage('operative', move),
-    model: currentState.agents[currentState.currentTeam].operative,
-    team: currentState.currentTeam,
-    cards: currentState.cards,
-  });
 
   // Reset recently revealed cards
   resetAnimations(newState.cards);
 
-  newState.currentGuesses = move.guesses;
+  const appliedGuesses: string[] = [];
 
   for (const guess of move.guesses) {
-    const card = newState.cards.find((card) => card.word.toUpperCase() === guess.toUpperCase());
+    const card = findCardForGuess(newState.cards, guess);
 
     // If card not found or already revealed, it's an invalid guess
     if (!card || card.isRevealed) {
       console.error(`INVALID GUESS: ${guess}`);
       continue;
     }
+
+    appliedGuesses.push(card.word);
 
     card.isRevealed = true;
     card.wasRecentlyRevealed = true;
@@ -209,6 +243,7 @@ export function updateGameStateFromOperativeMove(
     if (card.color === 'black') {
       newState.gameWinner = currentState.currentTeam === 'red' ? 'blue' : 'red';
       resetAnimations(newState.cards);
+      appendOperativeChatMessage(newState, currentState, move, appliedGuesses);
       return newState;
     }
 
@@ -222,10 +257,12 @@ export function updateGameStateFromOperativeMove(
     // If no more cards remain for the team, they win
     if (newState.remainingRed === 0) {
       newState.gameWinner = 'red';
+      appendOperativeChatMessage(newState, currentState, move, appliedGuesses);
       return newState;
     } else if (newState.remainingBlue === 0) {
       newState.gameWinner = 'blue';
       resetAnimations(newState.cards);
+      appendOperativeChatMessage(newState, currentState, move, appliedGuesses);
       return newState;
     }
 
@@ -240,5 +277,6 @@ export function updateGameStateFromOperativeMove(
   newState.currentTeam = currentState.currentTeam === 'red' ? 'blue' : 'red';
   // newState.currentClue = undefined;
 
+  appendOperativeChatMessage(newState, currentState, move, appliedGuesses);
   return newState;
 }

@@ -23,7 +23,11 @@ import {
   updateGameStateFromOperativeMove,
   updateGameStateFromSpymasterMove,
 } from './utils/game';
-import { AssistantPrefill, createMessagesFromGameState, streamLLMResponse } from './utils/llm';
+import {
+  AssistantPrefill,
+  createLlmRequest,
+  streamLLMResponse,
+} from './utils/llm';
 import {
   createNextGameTitle,
   createSavedGame,
@@ -31,6 +35,13 @@ import {
   persistGameLibrary,
   type SavedGameRecord,
 } from './utils/persistence';
+import {
+  getActiveModels,
+} from './utils/models';
+import {
+  isAssistantPrefillEnabled,
+  isAutoResumeOnIdleEnabled,
+} from './utils/modelCatalog';
 
 type AppState = 'game_start' | 'ready_for_turn' | 'waiting_for_response' | 'error' | 'game_over';
 type PendingRequest = {
@@ -122,8 +133,7 @@ export default function App() {
     () => initialActiveGame.pendingChatMessage,
   );
   const [streamedTokenCount, setStreamedTokenCount] = useState(0);
-  const [hiddenThinkingUpdateCount, setHiddenThinkingUpdateCount] = useState(0);
-  const [requestAgeSeconds, setRequestAgeSeconds] = useState(0);
+  const [streamConnected, setStreamConnected] = useState(false);
   const [requestEpoch, setRequestEpoch] = useState(0);
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const activeTurnKeyRef = useRef<string | null>(null);
@@ -151,7 +161,7 @@ export default function App() {
     setIdleWarningMessage(null);
     setPendingRequest(null);
     setStreamedTokenCount(0);
-    setHiddenThinkingUpdateCount(0);
+    setStreamConnected(false);
     lastIdleResumeSignatureRef.current = null;
   };
 
@@ -183,7 +193,6 @@ export default function App() {
     setIsGamePaused(forcePaused ? true : savedGame.isGamePaused);
     setErrorMessage(savedGame.errorMessage);
     setPendingChatMessage(savedGame.pendingChatMessage);
-    setRequestAgeSeconds(0);
   };
 
   const openSavedGame = (savedGame: SavedGameRecord) => {
@@ -240,7 +249,7 @@ export default function App() {
       setIdleWarningMessage(null);
       setPendingRequest(null);
       setStreamedTokenCount(0);
-      setHiddenThinkingUpdateCount(0);
+      setStreamConnected(false);
       if (appState === 'waiting_for_response') {
         setAppState('ready_for_turn');
       }
@@ -253,7 +262,7 @@ export default function App() {
       setPendingRequest(null);
       setPendingChatMessage(null);
       setStreamedTokenCount(0);
-      setHiddenThinkingUpdateCount(0);
+      setStreamConnected(false);
       setIsGamePaused(true);
       setAppState('game_over');
       return;
@@ -273,7 +282,7 @@ export default function App() {
       const savedPrefill =
         pendingChatMessage?.turnKey === turnKey ? pendingChatMessage.prefill : undefined;
       const assistantPrefill =
-        savedPrefill && activeModel.openRouterAssistantPrefillEnabled !== false ?
+        savedPrefill && isAssistantPrefillEnabled(activeModel) ?
           savedPrefill
           : undefined;
       const resumeMode =
@@ -294,7 +303,7 @@ export default function App() {
       setErrorMessage(null);
       setIdleWarningMessage(null);
       setStreamedTokenCount(0);
-      setHiddenThinkingUpdateCount(savedPrefill?.reasoningDetails?.length ?? 0);
+      setStreamConnected(false);
 
       console.info('[llm] starting turn', {
         modelId: activeModel.id,
@@ -309,12 +318,9 @@ export default function App() {
       void (async () => {
         try {
           let completedMove: SpymasterMove | OperativeMove | null = null;
+          const llmRequest = createLlmRequest(turnState, assistantPrefill);
           for await (const update of streamLLMResponse(
-            {
-              messages: createMessagesFromGameState(turnState, assistantPrefill),
-              modelId: activeModel.id,
-              role: turnState.currentRole,
-            },
+            llmRequest,
             controller.signal,
             {
               onIdleStateChange: (message) => {
@@ -336,8 +342,8 @@ export default function App() {
                     : null;
 
                 if (
-                  activeModel.autoResumeOnIdle !== false &&
-                  activeModel.openRouterAssistantPrefillEnabled !== false &&
+                  isAutoResumeOnIdleEnabled(activeModel) &&
+                  isAssistantPrefillEnabled(activeModel) &&
                   savedPrefillForTurn &&
                   (savedPrefillForTurn.content.trim() || savedPrefillForTurn.reasoningDetails?.length) &&
                   prefillSignature &&
@@ -354,7 +360,7 @@ export default function App() {
                   setIdleWarningMessage('No output for 15s. Resuming from saved prefill...');
                   setPendingRequest(null);
                   setStreamedTokenCount(0);
-                  setHiddenThinkingUpdateCount(0);
+                  setStreamConnected(false);
                   setRequestEpoch((value) => value + 1);
                   setAppState('ready_for_turn');
                   setIsGamePaused(false);
@@ -369,13 +375,28 @@ export default function App() {
               return;
             }
 
+            if (update.type === 'stream_open') {
+              setStreamConnected(true);
+              setPendingChatMessage((current) =>
+                current?.turnKey === turnKey ?
+                  current
+                  : {
+                      turnKey,
+                      team: turnState.currentTeam,
+                      role: turnState.currentRole,
+                      reasoning: '',
+                      prefill: { content: '' },
+                    },
+              );
+              continue;
+            }
+
             if (update.type === 'progress') {
               setStreamedTokenCount(update.tokenCount);
               continue;
             }
 
             if (update.type === 'prefill') {
-              setHiddenThinkingUpdateCount(update.prefill.reasoningDetails?.length ?? 0);
               setPendingChatMessage((current) => ({
                 turnKey,
                 team: turnState.currentTeam,
@@ -401,7 +422,9 @@ export default function App() {
               continue;
             }
 
-            completedMove = update.move;
+            if (update.type === 'complete') {
+              completedMove = update.move;
+            }
           }
 
           if (activeRequestControllerRef.current !== controller || controller.signal.aborted) {
@@ -415,7 +438,7 @@ export default function App() {
           setPendingChatMessage(null);
           setIdleWarningMessage(null);
           setStreamedTokenCount(0);
-          setHiddenThinkingUpdateCount(0);
+          setStreamConnected(false);
           lastIdleResumeSignatureRef.current = null;
           if (turnState.currentRole === 'spymaster') {
             setGameState(updateGameStateFromSpymasterMove(turnState, completedMove as SpymasterMove));
@@ -433,7 +456,7 @@ export default function App() {
           setPendingChatMessage(null);
           setIdleWarningMessage(null);
           setStreamedTokenCount(0);
-          setHiddenThinkingUpdateCount(0);
+          setStreamConnected(false);
           lastIdleResumeSignatureRef.current = null;
           setErrorMessage(
             error instanceof Error ?
@@ -456,7 +479,7 @@ export default function App() {
     if (appState === 'game_start') {
       setAppState('ready_for_turn');
     }
-  }, [appState, gameState, isGamePaused, requestEpoch]);
+  }, [appState, gameState, isGamePaused, pendingChatMessage, requestEpoch]);
 
   useEffect(() => {
     return () => {
@@ -469,21 +492,7 @@ export default function App() {
     if (chatContainerRef.current) {
       chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
     }
-  }, [gameState, appState]);
-
-  useEffect(() => {
-    if (!pendingRequest) {
-      setRequestAgeSeconds(0);
-      return;
-    }
-
-    setRequestAgeSeconds(Math.floor((Date.now() - pendingRequest.startedAt) / 1000));
-    const interval = window.setInterval(() => {
-      setRequestAgeSeconds(Math.floor((Date.now() - pendingRequest.startedAt) / 1000));
-    }, 1000);
-
-    return () => window.clearInterval(interval);
-  }, [pendingRequest]);
+  }, [gameState, appState, pendingChatMessage, streamedTokenCount, streamConnected]);
 
   return (
     <div className='flex min-h-screen w-full flex-col bg-gradient-to-br from-slate-800 to-slate-600 antialiased lg:h-screen lg:flex-row lg:overflow-hidden'>
@@ -646,7 +655,9 @@ export default function App() {
               resetTransientUi();
             }
             if (appState === 'game_over' || appState === 'error') {
-              setGameState(initializeGameState());
+              setGameState(
+                initializeGameState(getActiveModels()),
+              );
               setAppState('game_start');
               setErrorMessage(null);
               setPendingChatMessage(null);
@@ -686,55 +697,46 @@ export default function App() {
       >
         {/* Spinner & Pause indicator */}
         {appState === 'waiting_for_response' && (
-          <div className='sticky top-0 z-10 mb-2 -mx-2 -mt-2 flex w-full flex-col border-b border-slate-500/40 bg-slate-900/95 px-4 py-3 text-xs font-semibold tracking-wide text-slate-100 shadow-sm backdrop-blur-md'>
-            <div className='flex items-start justify-between'>
-              <div className='flex flex-col'>
-                <div className='flex items-center gap-2'>
-                  <Loader2 className='size-4 animate-spin text-slate-200' />
-                  <span>{pendingRequest?.modelName ?? 'LLM'} thinking</span>
-                </div>
-                <span className='ml-6 mt-1 text-[10px] font-medium uppercase tracking-[0.16em] text-slate-400'>
-                  {pendingRequest?.team} {pendingRequest?.role} · {requestAgeSeconds}s
-                </span>
-                <span className='ml-6 text-[10px] uppercase tracking-[0.16em] text-slate-500'>
-                  {streamedTokenCount > 0 ? `~${streamedTokenCount} toks returned`
-                    : hiddenThinkingUpdateCount > 0 ?
-                      `hidden CoT active · ${hiddenThinkingUpdateCount} updates`
-                      : 'waiting for first token'}
+          <div className='sticky top-0 z-10 mb-2 -mx-2 -mt-2 flex w-full items-center justify-between border-b border-slate-500/40 bg-slate-900/95 px-4 py-3 shadow-sm backdrop-blur-md'>
+            <div className='flex min-w-0 flex-1 flex-col gap-0.5'>
+              <div className='flex items-center gap-2'>
+                <Loader2 className='size-4 shrink-0 animate-spin text-slate-200' />
+                <span className='min-w-0 truncate text-sm text-slate-200'>
+                  <span className='font-medium text-slate-100'>
+                    {pendingRequest?.modelName ?? 'LLM'}
+                  </span>
+                  <span className='text-slate-400'> · reasoning...</span>
                 </span>
               </div>
-              <div className='flex flex-col items-end gap-2'>
-                <span className='text-[10px] uppercase tracking-[0.16em] text-slate-500'>
-                  {pendingRequest?.resumeMode === 'prefill' ? 'resume: prefill state'
-                    : pendingRequest?.resumeMode === 'prefill-disabled' ? 'resume: local state only'
-                      : 'resume: clean slate'}
-                </span>
-                <div className='flex gap-2'>
-                  <button
-                    type='button'
-                    onClick={() => {
-                      cancelActiveRequest();
-                      setIdleWarningMessage(null);
-                      setPendingRequest(null);
-                      setStreamedTokenCount(0);
-                      setIsGamePaused(true);
-                      setAppState('ready_for_turn');
-                    }}
-                    className='flex items-center gap-1 rounded bg-amber-500/20 px-2 py-1 text-[11px] font-bold uppercase tracking-[0.16em] text-amber-200 transition hover:bg-amber-500/30'
-                  >
-                    <Square className='size-3 fill-current' />
-                    Pause
-                  </button>
-                  <button
-                    type='button'
-                    onClick={retryCurrentTurn}
-                    className='flex items-center gap-1 rounded border border-rose-400/40 bg-rose-500/10 px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-rose-100 transition hover:bg-rose-500/20'
-                  >
-                    <RotateCcw className='size-3' />
-                    Retry
-                  </button>
-                </div>
-              </div>
+              <span className='ml-6 text-[10px] uppercase tracking-[0.16em] text-slate-500'>
+                ~{streamedTokenCount} toks streamed
+              </span>
+            </div>
+            <div className='flex gap-2'>
+              <button
+                type='button'
+                onClick={() => {
+                  cancelActiveRequest();
+                  setIdleWarningMessage(null);
+                  setPendingRequest(null);
+                  setStreamedTokenCount(0);
+                  setStreamConnected(false);
+                  setIsGamePaused(true);
+                  setAppState('ready_for_turn');
+                }}
+                className='flex items-center gap-1 rounded bg-amber-500/20 px-2 py-1 text-[11px] font-bold uppercase tracking-[0.16em] text-amber-200 transition hover:bg-amber-500/30'
+              >
+                <Square className='size-3 fill-current' />
+                Pause
+              </button>
+              <button
+                type='button'
+                onClick={retryCurrentTurn}
+                className='flex items-center gap-1 rounded border border-rose-400/40 bg-rose-500/10 px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-rose-100 transition hover:bg-rose-500/20'
+              >
+                <RotateCcw className='size-3' />
+                Retry
+              </button>
             </div>
           </div>
         )}
@@ -749,8 +751,9 @@ export default function App() {
                 </div>
                 {currentTurnPrefill && (
                   <span className='ml-6 mt-1 text-[10px] uppercase tracking-[0.16em] text-slate-500'>
-                    {gameState.agents[currentTurnPrefill.team][currentTurnPrefill.role]
-                      .openRouterAssistantPrefillEnabled === false ?
+                    {!isAssistantPrefillEnabled(
+                      gameState.agents[currentTurnPrefill.team][currentTurnPrefill.role],
+                    ) ?
                       'local state only'
                       : 'saved prefill active'}
                   </span>
@@ -786,15 +789,17 @@ export default function App() {
         {gameState.chatHistory.map((message, index) => (
           <Chat key={index} {...message} />
         ))}
-        {pendingChatMessage?.reasoning.trim() && (
-          <Chat
-            message={pendingChatMessage.reasoning}
-            model={gameState.agents[pendingChatMessage.team][pendingChatMessage.role]}
-            team={pendingChatMessage.team}
-            cards={gameState.cards}
-            isStreaming={Boolean(pendingRequest)}
-          />
-        )}
+        {pendingRequest &&
+          pendingChatMessage &&
+          (streamConnected || pendingChatMessage.reasoning.trim()) && (
+            <Chat
+              message={pendingChatMessage.reasoning}
+              model={gameState.agents[pendingChatMessage.team][pendingChatMessage.role]}
+              team={pendingChatMessage.team}
+              cards={gameState.cards}
+              isStreaming={Boolean(pendingRequest)}
+            />
+          )}
         {appState === 'game_over' && (
           <div className='flex w-full justify-center p-2 font-semibold tracking-wide'>
             <div
